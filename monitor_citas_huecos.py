@@ -172,7 +172,14 @@ def revisar_una_vez(headless: bool = True) -> Tuple[bool, List[Tuple[str, str]],
         return (False, [], fecha)
 
 def main():
-    # Bucle de monitoreo
+    # Si existe la variable de prueba, enviamos mensaje y salimos
+    if os.getenv("FORCE_TEST") == "1":
+        notify("🚀 Test OK: el bot está listo y puede enviarte alertas por Telegram.")
+        print("[TEST] Notificación de prueba enviada.")
+        time.sleep(5)
+        sys.exit(0)
+
+    # Bucle normal de monitoreo
     while True:
         try:
             ok, slots, fecha = revisar_una_vez(headless=True)
@@ -180,7 +187,6 @@ def main():
                 primeras = ", ".join(sorted({h for h, _ in slots})[:5])
                 f = f" ({fecha})" if fecha else ""
                 notify(f"✅ ¡HAY HUECOS!{f} → Horas: {primeras}\nEntra ya: {cfg.URL}")
-                # Después de encontrar huecos, espera un poco antes de volver a revisar
                 time.sleep(300)
             else:
                 marca = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -189,6 +195,7 @@ def main():
         except Exception as e:
             print(f"[ERROR] {e}", flush=True)
             time.sleep(120)
+
 
 if __name__ == "__main__":
     # Ejecuta:  python monitor_citas_huecos.py
