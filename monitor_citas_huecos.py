@@ -12,29 +12,30 @@ import requests
 class Config:
     URL: str = "https://www.citaconsular.es/es/hosteds/widgetdefault/25b18886db70f7ec9fd6dfd1a85d1395f/"
 
-    # Selectores/indicadores (ajustados a capturas típicas de Bookitit/citaconsular)
+    # Selectores/indicadores
     SELECTOR_CONTINUE: str = 'button.btn.btn-success, button:has-text("Continue"), button:has-text("Continuar")'
     TEXT_NO_CITAS: str = "No hay horas disponibles"
     # Candidatos a botones que contienen hora y la leyenda "Hueco libre"
     BUTTON_CANDIDATES: str = "button, .btn, [role=button]"
 
-    # Hints para extraer fecha visible (ej: "Miércoles 3 de Septiembre de 2025")
-    DIA_REGEX = r"(Lunes|Martes|Miércoles|Jueves|Viernes|Sábado|Domingo).*?\\b\\d{4}\\b"
+    # Fecha visible, p.e. "Miércoles 3 de Septiembre de 2025"
+    DIA_REGEX: str = r"(Lunes|Martes|Miércoles|Jueves|Viernes|Sábado|Domingo).*?\b\d{4}\b"
 
-    # Revisión periódica
+    # Intervalo base entre chequeos (segundos)
     CHECK_INTERVAL_SEC: int = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
 
     # Notificaciones (opcional)
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # Anti-bloqueos
+    # Pausas tipo humano entre acciones
     HUMAN_MIN: float = float(os.getenv("HUMAN_MIN", "0.7"))
     HUMAN_MAX: float = float(os.getenv("HUMAN_MAX", "1.5"))
 
 cfg = Config()
 
 def notify(msg: str):
+    """Envía texto por Telegram (y también lo imprime en logs)."""
     print(msg, flush=True)
     if cfg.TELEGRAM_BOT_TOKEN and cfg.TELEGRAM_CHAT_ID:
         try:
@@ -45,6 +46,20 @@ def notify(msg: str):
             )
         except Exception as e:
             print(f"[WARN] Telegram fallo: {e}", file=sys.stderr)
+
+def send_photo(path: str, caption: str = ""):
+    """Envía una foto por Telegram usando sendPhoto."""
+    if not (cfg.TELEGRAM_BOT_TOKEN and cfg.TELEGRAM_CHAT_ID):
+        print("[WARN] Telegram no configurado; no se puede enviar foto.")
+        return
+    try:
+        with open(path, "rb") as f:
+            url = f"https://api.telegram.org/bot{cfg.TELEGRAM_BOT_TOKEN}/sendPhoto"
+            data = {"chat_id": cfg.TELEGRAM_CHAT_ID, "caption": caption}
+            files = {"photo": (os.path.basename(path), f, "image/jpeg")}
+            requests.post(url, data=data, files=files, timeout=30)
+    except Exception as e:
+        print(f"[WARN] Falló send_photo: {e}", file=sys.stderr)
 
 # Navegadores/OS comunes (versiones recientes)
 USER_AGENTS = [
@@ -62,30 +77,26 @@ USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
 ]
 
-
 def human_pause():
     time.sleep(random.uniform(cfg.HUMAN_MIN, cfg.HUMAN_MAX))
 
-TIME_RE = re.compile(r"\\b([01]?\\d|2[0-3]):[0-5]\\d\\b")  # 0:00–23:59
+TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")  # 0:00–23:59
 
 def find_date_text(page) -> Optional[str]:
-    # Buscamos un texto tipo "Miércoles 3 de Septiembre de 2025"
+    """Intenta extraer la fecha visible (día + año) del calendario."""
     try:
         content = (page.content() or "").strip()
     except Exception:
         return None
-    # Buscar rápidamente por regex
     m = re.search(cfg.DIA_REGEX, content, re.IGNORECASE | re.DOTALL)
-    if m:
-        return m.group(0)
-    return None
+    return m.group(0) if m else None
 
 def extract_real_slots(page) -> List[Tuple[str, str]]:
     """
     Devuelve lista de (hora, texto_boton) únicamente si el botón contiene una hora
-    y, en el mismo bloque, aparece 'Hueco libre' (para evitar falsos positivos).
+    y, en el mismo bloque, aparece 'Hueco libre' (evita falsos positivos).
     """
-    slots = []
+    slots: List[Tuple[str, str]] = []
     try:
         candidates = page.locator(cfg.BUTTON_CANDIDATES)
         count = candidates.count()
@@ -109,23 +120,27 @@ def extract_real_slots(page) -> List[Tuple[str, str]]:
             continue
     return slots
 
-with sync_playwright() as p:
-    browser = p.chromium.launch(headless=headless)
+def revisar_una_vez(headless: bool = True) -> Tuple[bool, List[Tuple[str, str]], Optional[str]]:
+    """
+    Retorna: (hay_huecos, slots, fecha_visible)
+    slots = lista [(hora, texto_boton)...]
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
 
-    # Rotar User-Agent y tamaño de ventana en cada pasada (parece más humano)
-    ua = random.choice(USER_AGENTS)
-    vw = random.randint(1200, 1440)
-    vh = random.randint(800, 960)
+        # Rotar User-Agent y tamaño de ventana en cada pasada (parece más humano)
+        ua = random.choice(USER_AGENTS)
+        vw = random.randint(1200, 1440)
+        vh = random.randint(800, 960)
 
-    context = browser.new_context(
-        viewport={"width": vw, "height": vh},
-        user_agent=ua,
-        locale="es-ES",
-        extra_http_headers={"Accept-Language": "es-MX,es;q=0.9,en;q=0.8"}
-    )
+        context = browser.new_context(
+            viewport={"width": vw, "height": vh},
+            user_agent=ua,
+            locale="es-ES",
+            extra_http_headers={"Accept-Language": "es-MX,es;q=0.9,en;q=0.8"}
+        )
 
-
-        # Primer aviso: alert("Welcome / Bienvenido") — aceptar automáticamente
+        # Aceptar el dialog inicial (Welcome/Bienvenido)
         def on_dialog(dialog):
             try:
                 dialog.accept()
@@ -176,23 +191,26 @@ with sync_playwright() as p:
                     continue
 
         if slots:
+            # Guardar captura JPEG (más ligera) para enviar por Telegram
+            jpg_path = "/tmp/citas_disponibles.jpg"
             try:
-                page.screenshot(path="citas_disponibles.png", full_page=True)
+                page.screenshot(path=jpg_path, type="jpeg", quality=70, full_page=True)
             except Exception:
-                pass
+                jpg_path = None
             browser.close()
+            # Devolvemos slots + fecha; la captura se enviará desde main()
             return (True, slots, fecha)
 
         # No hay texto de “no hay horas…”, pero tampoco huecos reales:
         try:
-            page.screenshot(path="sin_huecos.png", full_page=True)
+            page.screenshot(path="/tmp/sin_huecos.jpg", type="jpeg", quality=60, full_page=True)
         except Exception:
             pass
         browser.close()
         return (False, [], fecha)
 
 def main():
-    # Si existe la variable de prueba, enviamos mensaje y salimos
+    # Modo prueba: envía un mensaje y termina
     if os.getenv("FORCE_TEST") == "1":
         notify("🚀 Test OK: el bot está listo y puede enviarte alertas por Telegram.")
         print("[TEST] Notificación de prueba enviada.")
@@ -206,24 +224,29 @@ def main():
             if ok and slots:
                 primeras = ", ".join(sorted({h for h, _ in slots})[:5])
                 f = f" ({fecha})" if fecha else ""
-                notify(f"✅ ¡HAY HUECOS!{f} → Horas: {primeras}\nEntra ya: {cfg.URL}")
+                caption = f"✅ ¡HAY HUECOS!{f} → Horas: {primeras}\nEntra ya: {cfg.URL}"
+                notify(caption)
+                # Intentar enviar captura si existe
+                jpg_path = "/tmp/citas_disponibles.jpg"
+                if os.path.exists(jpg_path):
+                    send_photo(jpg_path, caption)
+                # Espera 5 min para evitar spam si siguen los mismos huecos
                 time.sleep(300)
             else:
-    marca = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{marca}] Sin huecos reales por ahora.", flush=True)
+                marca = time.strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{marca}] Sin huecos reales por ahora.", flush=True)
 
-    # Intervalo aleatorio para simular comportamiento humano
-    min_wait = max(30, cfg.CHECK_INTERVAL_SEC - 15)
-    max_wait = cfg.CHECK_INTERVAL_SEC + 30
-    wait_time = random.randint(min_wait, max_wait)
+                # Intervalo aleatorio para simular comportamiento humano
+                min_wait = max(30, cfg.CHECK_INTERVAL_SEC - 15)
+                max_wait = cfg.CHECK_INTERVAL_SEC + 30
+                wait_time = random.randint(min_wait, max_wait)
 
-    print(f"[INFO] Esperando {wait_time} segundos antes del siguiente chequeo...", flush=True)
-    time.sleep(wait_time)
+                print(f"[INFO] Esperando {wait_time} segundos antes del siguiente chequeo...", flush=True)
+                time.sleep(wait_time)
 
         except Exception as e:
             print(f"[ERROR] {e}", flush=True)
             time.sleep(120)
-
 
 if __name__ == "__main__":
     # Ejecuta:  python monitor_citas_huecos.py
@@ -234,3 +257,4 @@ if __name__ == "__main__":
         print("OK:", ok, "slots:", slots, "fecha:", fecha)
     else:
         main()
+
