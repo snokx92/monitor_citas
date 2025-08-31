@@ -46,6 +46,23 @@ def notify(msg: str):
         except Exception as e:
             print(f"[WARN] Telegram fallo: {e}", file=sys.stderr)
 
+# Navegadores/OS comunes (versiones recientes)
+USER_AGENTS = [
+    # Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
+    # macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4; rv:127.0) Gecko/20100101 Firefox/127.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    # iPhone (Safari)
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    # Android (Chrome)
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+]
+
+
 def human_pause():
     time.sleep(random.uniform(cfg.HUMAN_MIN, cfg.HUMAN_MAX))
 
@@ -92,18 +109,21 @@ def extract_real_slots(page) -> List[Tuple[str, str]]:
             continue
     return slots
 
-def revisar_una_vez(headless: bool = True) -> Tuple[bool, List[Tuple[str, str]], Optional[str]]:
-    """
-    Retorna: (hay_huecos, slots, fecha_visible)
-    slots = lista [(hora, texto_boton)...]
-    """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124 Safari/537.36")
-        )
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=headless)
+
+    # Rotar User-Agent y tamaño de ventana en cada pasada (parece más humano)
+    ua = random.choice(USER_AGENTS)
+    vw = random.randint(1200, 1440)
+    vh = random.randint(800, 960)
+
+    context = browser.new_context(
+        viewport={"width": vw, "height": vh},
+        user_agent=ua,
+        locale="es-ES",
+        extra_http_headers={"Accept-Language": "es-MX,es;q=0.9,en;q=0.8"}
+    )
+
 
         # Primer aviso: alert("Welcome / Bienvenido") — aceptar automáticamente
         def on_dialog(dialog):
