@@ -1,5 +1,5 @@
 
-# Monitor de Citas — Consulado de España (Render 24/7)
+# Monitor de Citas
 
 Bot en **Python + Playwright** que revisa la página de citas de citaconsular.es y **envía alerta por Telegram** solo cuando detecta **huecos reales** (botón con hora + texto "Hueco libre").
 
