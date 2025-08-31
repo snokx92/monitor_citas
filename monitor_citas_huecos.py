@@ -209,9 +209,17 @@ def main():
                 notify(f"✅ ¡HAY HUECOS!{f} → Horas: {primeras}\nEntra ya: {cfg.URL}")
                 time.sleep(300)
             else:
-                marca = time.strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{marca}] Sin huecos reales por ahora.", flush=True)
-                time.sleep(cfg.CHECK_INTERVAL_SEC)
+    marca = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{marca}] Sin huecos reales por ahora.", flush=True)
+
+    # Intervalo aleatorio para simular comportamiento humano
+    min_wait = max(30, cfg.CHECK_INTERVAL_SEC - 15)
+    max_wait = cfg.CHECK_INTERVAL_SEC + 30
+    wait_time = random.randint(min_wait, max_wait)
+
+    print(f"[INFO] Esperando {wait_time} segundos antes del siguiente chequeo...", flush=True)
+    time.sleep(wait_time)
+
         except Exception as e:
             print(f"[ERROR] {e}", flush=True)
             time.sleep(120)
