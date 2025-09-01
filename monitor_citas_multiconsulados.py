@@ -8,72 +8,43 @@ from typing import List, Optional, Tuple, Dict
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PTimeout
 
-# -----------------------------
-# Configuracion
-# -----------------------------
-class Cfg:
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+# ========================
+# Variables de entorno
+# ========================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
-    HUMAN_MIN = float(os.getenv("HUMAN_MIN", "0.7"))
-    HUMAN_MAX = float(os.getenv("HUMAN_MAX", "1.5"))
+# Intervalo por defecto subido a 120s para ahorrar datos
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "120"))
+HUMAN_MIN = float(os.getenv("HUMAN_MIN", "0.7"))
+HUMAN_MAX = float(os.getenv("HUMAN_MAX", "1.5"))
 
-    # Boton "Continue / Continuar" de Bookitit
-    SELECTOR_CONTINUE = 'button.btn.btn-success, button:has-text("Continue"), button:has-text("Continuar")'
+# Enviar fotos solo cuando valen la pena. Si pones 1, también enviará "no_citas" y "timeout"
+SEND_ALL_SHOTS = os.getenv("SEND_ALL_SHOTS", "0") == "1"
+DEBUG_SHOT = os.getenv("DEBUG_SHOT", "0") == "1"
 
-    # Para CDMX el calendario aparece al hacer click en el panel de texto
-    # (solo un click al bloque de texto grande)
-    # Modo "cdmx_panel" en CONSUL_URLS.
-    CONSUL_URLS = os.getenv(
-        "CONSUL_URLS",
-        ",".join([
-            "Monterrey|https://www.citaconsular.es/es/hosteds/widgetdefault/25b18886db70f7ec9fd6dfd1a85d1395f/|default",
-            "Ciudad de Mexico|https://www.citaconsular.es/es/hosteds/widgetdefault/21b7c1aaf9fef2785deb64ccab5ceca06/|cdmx_panel",
-            "Miami|https://www.citaconsular.es/es/hosteds/widgetdefault/2533f04b1d3e818b66f175afc9c24cf63/|default",
-        ])
-    )
+# Ahorro de datos: bloquea recursos pesados opcionalmente
+# (imágenes/medios suelen ser irrelevantes para detectar horas HH:MM)
+BLOCK_IMAGES = os.getenv("BLOCK_IMAGES", "1") == "1"
+BLOCK_FONTS  = os.getenv("BLOCK_FONTS", "1") == "1"
 
-    DEBUG_SHOT = os.getenv("DEBUG_SHOT", "0") == "1"
-    SEND_ALL_SHOTS = os.getenv("SEND_ALL_SHOTS", "0") == "1"
+# Proxies residenciales (solo se usan si detectamos bloqueo "blank")
+PROXY_LIST = [s.strip() for s in os.getenv("PROXY_LIST", "").split(",") if s.strip()]
+RETRIES_ON_BLOCK = int(os.getenv("RETRIES_ON_BLOCK", "2"))  # reintentos con otros proxies si hay "blank"
 
-    PROXY_LIST = os.getenv("PROXY_LIST", "").strip()
-    ROTATE_PROXY_EACH_ROUND = os.getenv("ROTATE_PROXY_EACH_ROUND", "1") == "1"
-    RETRIES_PER_SITE = int(os.getenv("RETRIES_PER_SITE", "2"))
+# Lista de consulados. Modo: default | cdmx_panel
+CONSUL_URLS = os.getenv(
+    "CONSUL_URLS",
+    ",".join([
+        "Monterrey|https://www.citaconsular.es/es/hosteds/widgetdefault/25b18886db70f7ec9fd6dfd1a85d1395f/|default",
+        "Ciudad de Mexico|https://www.citaconsular.es/es/hosteds/widgetdefault/21b7c1aaf9fef2785deb64ccab5ceca06/|cdmx_panel",
+        "Miami|https://www.citaconsular.es/es/hosteds/widgetdefault/2533f04b1d3e818b66f175afc9c24cf63/|default",
+    ])
+)
 
-cfg = Cfg()
-
-# -----------------------------
-# Telegram helpers
-# -----------------------------
-def notify(msg: str) -> None:
-    print(msg, flush=True)
-    if cfg.TELEGRAM_BOT_TOKEN and cfg.TELEGRAM_CHAT_ID:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{cfg.TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": msg},
-                timeout=25,
-            )
-        except Exception as e:
-            print(f"[WARN] Telegram fallo: {e}", file=sys.stderr)
-
-def send_photo(path: str, caption: str = "") -> None:
-    if not (cfg.TELEGRAM_BOT_TOKEN and cfg.TELEGRAM_CHAT_ID):
-        print("[WARN] Telegram no configurado; no se puede enviar foto.")
-        return
-    try:
-        with open(path, "rb") as f:
-            url = f"https://api.telegram.org/bot{cfg.TELEGRAM_BOT_TOKEN}/sendPhoto"
-            data = {"chat_id": cfg.TELEGRAM_CHAT_ID, "caption": caption}
-            files = {"photo": (os.path.basename(path), f, "image/jpeg")}
-            requests.post(url, data=data, files=files, timeout=45)
-    except Exception as e:
-        print(f"[WARN] send_photo fallo: {e}", file=sys.stderr)
-
-# -----------------------------
-# Human/stealth
-# -----------------------------
+# ========================
+# Utilidades
+# ========================
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
@@ -89,20 +60,41 @@ Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
 window.chrome = { runtime: {} };
 """
 
-def human_pause() -> None:
-    time.sleep(random.uniform(cfg.HUMAN_MIN, cfg.HUMAN_MAX))
-
-# -----------------------------
-# Parsing util
-# -----------------------------
-TIME_RE = re.compile(r"\\b([01]?\\d|2[0-3]):[0-5]\\d\\b")
-
+TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
 NO_CITAS_PATTERNS = [
     "No hay horas disponibles",
     "No hay citas disponibles",
     "No hay disponibilidad",
     "Inténtelo de nuevo dentro de unos días",
 ]
+
+def notify(msg: str) -> None:
+    print(msg, flush=True)
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+                timeout=25
+            )
+        except Exception as e:
+            print(f"[WARN] Telegram fallo: {e}", file=sys.stderr)
+
+def send_photo(path: str, caption: str = "") -> None:
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        print("[WARN] Telegram no configurado; no se puede enviar foto.")
+        return
+    try:
+        with open(path, "rb") as f:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+            data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption}
+            files = {"photo": (os.path.basename(path), f, "image/jpeg")}
+            requests.post(url, data=data, files=files, timeout=45)
+    except Exception as e:
+        print(f"[WARN] send_photo fallo: {e}", file=sys.stderr)
+
+def human_pause() -> None:
+    time.sleep(random.uniform(HUMAN_MIN, HUMAN_MAX))
 
 def parse_consul_list(env_val: str) -> List[Tuple[str, str, str]]:
     out: List[Tuple[str, str, str]] = []
@@ -113,9 +105,6 @@ def parse_consul_list(env_val: str) -> List[Tuple[str, str, str]]:
             mode = parts[2].lower() if len(parts) >= 3 else "default"
             out.append((name, url, mode))
     return out
-
-def parse_proxies(env_val: str) -> List[str]:
-    return [s.strip() for s in env_val.split(",") if s.strip()]
 
 def choose_proxy(proxies: List[str]) -> Optional[dict]:
     if not proxies:
@@ -144,7 +133,7 @@ def find_time_nodes_anywhere(page) -> List[str]:
     horas = set()
     # main
     try:
-        times = page.locator(r"text=/\\b([01]?\\d|2[0-3]):[0-5]\\d\\b/")
+        times = page.locator(r"text=/\b([01]?\d|2[0-3]):[0-5]\d\b/")
         n = times.count()
         for i in range(min(n, 600)):
             try:
@@ -164,7 +153,7 @@ def find_time_nodes_anywhere(page) -> List[str]:
         for fr in page.frames:
             if fr == page.main_frame:
                 continue
-            times = fr.locator(r"text=/\\b([01]?\\d|2[0-3]):[0-5]\\d\\b/")
+            times = fr.locator(r"text=/\b([01]?\d|2[0-3]):[0-5]\d\b/")
             n = times.count()
             for i in range(min(n, 600)):
                 try:
@@ -212,7 +201,7 @@ def page_has_no_citas_visible(page) -> bool:
     return False
 
 def wait_calendar_ready(page, timeout_ms: int = 22000) -> str:
-    deadline = time.time() + (timeout_ms/1000.0)
+    deadline = time.time() + (timeout_ms / 1000.0)
     while time.time() < deadline:
         if find_time_nodes_anywhere(page):
             return "hours"
@@ -247,7 +236,7 @@ def visual_ready_for_photo(page) -> bool:
     return False
 
 def shoot_best_view(page, name: str, suffix: str) -> Optional[str]:
-    # intenta iframe mas grande, si no la pagina completa
+    # 1) iframe más grande
     try:
         ifr = page.locator("iframe")
         n = ifr.count()
@@ -270,99 +259,79 @@ def shoot_best_view(page, name: str, suffix: str) -> Optional[str]:
         if biggest_i >= 0:
             el = ifr.nth(biggest_i)
             path = f"/tmp/{name.replace(' ', '_').lower()}_{suffix}_iframe.jpg"
-            el.screenshot(path=path, type="jpeg", quality=75)
+            el.screenshot(path=path, type="jpeg", quality=70)
             return path
     except Exception:
         pass
+    # 2) página completa
     try:
         path = f"/tmp/{name.replace(' ', '_').lower()}_{suffix}_page.jpg"
-        page.screenshot(path=path, type="jpeg", quality=75, full_page=True)
+        page.screenshot(path=path, type="jpeg", quality=70, full_page=True)
         return path
     except Exception:
         return None
 
-# -----------------------------
-# Network diag
-# -----------------------------
-def _dump_network_on(context, bucket: list) -> None:
-    def on_response(resp):
-        try:
-            bucket.append((resp.url, resp.status))
-        except Exception:
-            pass
-    context.on("response", on_response)
+def slots_signature(hours: List[str]) -> str:
+    return hashlib.sha256(",".join(sorted(hours)).encode("utf-8")).hexdigest()
 
-def _diagnose_page(page) -> dict:
-    info = {}
-    try:
-        info["url"] = page.url
-        try:
-            info["text_len"] = len((page.evaluate("document.body && document.body.innerText") or "").strip())
-        except Exception:
-            info["text_len"] = -1
-        info["html_len"] = len(page.content() or "")
-        ifr = page.locator("iframe")
-        n = ifr.count()
-        info["iframes_count"] = n
-        srcs = []
-        for i in range(min(n, 10)):
+# ========================
+# Playwright session
+# ========================
+def _open_context(p, proxy_conf: Optional[dict]):
+    browser = p.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--hide-scrollbars",
+            "--disable-gpu",
+        ],
+        proxy=proxy_conf
+    )
+    ua = random.choice(USER_AGENTS)
+    vw = random.randint(1200, 1440)
+    vh = random.randint(800, 960)
+    context = browser.new_context(
+        viewport={"width": vw, "height": vh},
+        user_agent=ua,
+        locale="es-ES",
+        extra_http_headers={"Accept-Language": "es-MX,es;q=0.9,en;q=0.8"},
+    )
+    context.add_init_script(STEALTH_JS)
+
+    # Ahorro de datos: bloquear imágenes/fonts si corresponde
+    if BLOCK_IMAGES or BLOCK_FONTS:
+        def route_handler(route):
             try:
-                el = ifr.nth(i)
-                if el.is_visible():
-                    srcs.append(el.get_attribute("src") or "(sin src)")
-            except Exception:
-                continue
-        info["iframe_srcs"] = srcs
-    except Exception as e:
-        info["diag_error"] = str(e)
-    return info
-
-# -----------------------------
-# Una pasada (posible proxy)
-# -----------------------------
-def _revisar_once(name: str, url: str, modo: str, headless: bool, proxy_conf: Optional[dict]) \
-        -> Tuple[str, List[str], Optional[str], Optional[str], Dict]:
-    """
-    Retorna: (status: 'hours'/'no_citas'/'timeout'/'blank', horas, fecha, shot_path, diag)
-    """
-    diag: Dict = {"proxy": proxy_conf.get("server") if proxy_conf else None}
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=headless,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--hide-scrollbars",
-                "--disable-gpu",
-            ],
-            proxy=proxy_conf
-        )
-
-        ua = random.choice(USER_AGENTS)
-        vw = random.randint(1200, 1440)
-        vh = random.randint(800, 960)
-
-        context = browser.new_context(
-            viewport={"width": vw, "height": vh},
-            user_agent=ua,
-            locale="es-ES",
-            extra_http_headers={"Accept-Language": "es-MX,es;q=0.9,en;q=0.8"},
-        )
-        context.add_init_script(STEALTH_JS)
-
-        netlog = []
-        _dump_network_on(context, netlog)
-
-        def on_dialog(d):
-            try:
-                d.accept()
+                rtype = route.request.resource_type
+                if BLOCK_IMAGES and rtype in ("image", "media"):
+                    return route.abort()
+                if BLOCK_FONTS and rtype in ("font",):
+                    return route.abort()
             except Exception:
                 pass
-        context.on("dialog", on_dialog)
+            return route.continue_()
+        context.route("**/*", route_handler)
 
-        page = context.new_page()
-        page.set_default_timeout(25000)
+    # Aceptar posibles dialogs
+    def on_dialog(dialog):
+        try:
+            dialog.accept()
+        except Exception:
+            pass
+    context.on("dialog", on_dialog)
+
+    page = context.new_page()
+    page.set_default_timeout(25000)
+    return browser, context, page
+
+# ========================
+# Una pasada por sitio (posible proxy)
+# ========================
+def revisar_once(name: str, url: str, mode: str, proxy_conf: Optional[dict]) -> Tuple[str, List[str], Optional[str], Optional[str]]:
+    with sync_playwright() as p:
+        browser, context, page = _open_context(p, proxy_conf)
 
         page.goto(url, wait_until="domcontentloaded")
         try:
@@ -371,22 +340,18 @@ def _revisar_once(name: str, url: str, modo: str, headless: bool, proxy_conf: Op
             pass
         human_pause()
 
-        # pagina "blank" (bloqueo)
+        # ¿página "vacía"? → posible bloqueo por IP/fingerprint
         body_txt = (visible_text(page) or "").strip()
         html_len = len(page.content() or "")
         if len(body_txt) < 8 and html_len < 1500:
-            d = _diagnose_page(page)
-            bad = [(u, s) for (u, s) in netlog if s and s >= 400]
-            d["bad_responses"] = bad[:10]
-            diag.update(d)
             browser.close()
-            return ("blank", [], None, None, diag)
+            return ("blank", [], None, None)
 
-        # flujo
-        if modo == "default":
+        # Flujo por modo
+        if mode == "default":
             try:
-                page.wait_for_selector(cfg.SELECTOR_CONTINUE, timeout=8000)
-                page.click(cfg.SELECTOR_CONTINUE, force=True)
+                page.wait_for_selector('button.btn.btn-success, button:has-text("Continue"), button:has-text("Continuar")', timeout=8000)
+                page.click('button.btn.btn-success, button:has-text("Continue"), button:has-text("Continuar")', force=True)
                 human_pause()
                 try:
                     page.wait_for_load_state("networkidle", timeout=8000)
@@ -394,7 +359,7 @@ def _revisar_once(name: str, url: str, modo: str, headless: bool, proxy_conf: Op
                     pass
             except PTimeout:
                 pass
-        elif modo == "cdmx_panel":
+        elif mode == "cdmx_panel":
             try:
                 panel = page.locator("text=/PRESENTACION|MEMORIA|CONTINUAR SUPONE/i, .panel, .well, .panel-body, .card")
                 if panel.count() > 0:
@@ -403,142 +368,102 @@ def _revisar_once(name: str, url: str, modo: str, headless: bool, proxy_conf: Op
             except Exception:
                 pass
 
-        # micro movimiento
-        try:
-            page.mouse.wheel(0, random.randint(100, 420))
-        except Exception:
-            pass
-
-        status = wait_calendar_ready(page, timeout_ms=24000)
-        fecha = None  # fecha es opcional
+        status = wait_calendar_ready(page, timeout_ms=22000)
+        fecha = None  # opcional
 
         if status == "hours":
-            horas = find_time_nodes_anywhere(page)
+            hours = find_time_nodes_anywhere(page)
             shot = shoot_best_view(page, name, "citas") if visual_ready_for_photo(page) else None
             browser.close()
-            return ("hours", horas, fecha, shot, diag)
+            return ("hours", hours, fecha, shot)
 
         if status == "no_citas":
-            shot = shoot_best_view(page, name, "no_citas") if (cfg.SEND_ALL_SHOTS and visual_ready_for_photo(page)) else None
+            shot = None
+            if SEND_ALL_SHOTS and visual_ready_for_photo(page):
+                shot = shoot_best_view(page, name, "no_citas")
             browser.close()
-            return ("no_citas", [], fecha, shot, diag)
+            return ("no_citas", [], fecha, shot)
 
         # timeout
-        horas = find_time_nodes_anywhere(page)
-        shot = shoot_best_view(page, name, "timeout") if (cfg.SEND_ALL_SHOTS and visual_ready_for_photo(page)) else None
+        hours = find_time_nodes_anywhere(page)
+        shot = None
+        if SEND_ALL_SHOTS and visual_ready_for_photo(page):
+            shot = shoot_best_view(page, name, "timeout")
         browser.close()
-        if horas:
-            return ("hours", horas, fecha, shot, diag)
-        return ("timeout", [], fecha, shot, diag)
+        if hours:
+            return ("hours", hours, fecha, shot)
+        return ("timeout", [], fecha, shot)
 
-# -----------------------------
-# Con reintentos y rotacion de proxy
-# -----------------------------
-def revisar_un_consulado(name: str, url: str, modo: str, headless: bool,
-                         proxies: Optional[List[str]]) -> Tuple[bool, List[str], Optional[str], Optional[str], Optional[str]]:
-    attempts: List[Optional[dict]] = []
-    if proxies and cfg.ROTATE_PROXY_EACH_ROUND:
-        attempts.append(choose_proxy(proxies))
-    else:
-        attempts.append(None)
-    for _ in range(max(0, cfg.RETRIES_PER_SITE)):
-        attempts.append(choose_proxy(proxies) if proxies else None)
+# ========================
+# Lógica: usa proxy SOLO si hay bloqueo
+# ========================
+def revisar_un_consulado(name: str, url: str, mode: str) -> Tuple[bool, List[str], Optional[str], Optional[str], Optional[str]]:
+    # 1) Intento sin proxy (ahorra datos y suele bastar)
+    status, hours, fecha, shot = revisar_once(name, url, mode, proxy_conf=None)
+    if status == "blank" and PROXY_LIST and RETRIES_ON_BLOCK > 0:
+        notify(f"⚠️ {name}: posible bloqueo detectado. Reintentando con proxy…")
+        # 2) Reintentos con proxies
+        attempts = min(RETRIES_ON_BLOCK, len(PROXY_LIST))
+        for _ in range(attempts):
+            proxy = choose_proxy(PROXY_LIST)
+            status, hours, fecha, shot = revisar_once(name, url, mode, proxy_conf=proxy)
+            if status != "blank":
+                break
 
-    last_block_msg = None
-    for idx, proxy_conf in enumerate(attempts, 1):
-        status, horas, fecha, shot, diag = _revisar_once(name, url, modo, headless, proxy_conf)
+    # Traducción de status a salida principal
+    if status == "hours":
+        return (True, hours, fecha, shot, None)
+    if status == "no_citas":
+        return (False, [], fecha, None, None)
+    if status == "timeout":
+        if hours:
+            return (True, hours, fecha, shot, None)
+        notify(f"⏳ {name}: timeout (sin horas).")
+        return (False, [], fecha, None, None)
+    # status == "blank"
+    return (False, [], None, None, "blank")
 
-        # log IP publica de vez en cuando
-        if random.random() < 0.1:
-            try:
-                ip = requests.get("https://api.ipify.org", timeout=5).text
-                print(f"[INFO] IP publica: {ip}", flush=True)
-            except Exception:
-                pass
-
-        if status == "blank":
-            bad = diag.get("bad_responses", [])
-            msg = (
-                f"⚠️ {name}: pagina parece vacia (posible bloqueo).\n"
-                f"- Proxy: {diag.get('proxy')}\n"
-                f"- iframes: {diag.get('iframes_count')} (ej: {', '.join(diag.get('iframe_srcs', [])[:3])})\n"
-                f"- text_len: {diag.get('text_len')}  html_len: {diag.get('html_len')}\n"
-                f"- respuestas >=400: {len(bad)}"
-            )
-            for (u, s) in bad[:5]:
-                msg += f"\n  · {s} -> {u[:120]}"
-            notify(msg)
-            last_block_msg = msg
-            continue
-
-        if status == "hours":
-            if cfg.SEND_ALL_SHOTS and shot:
-                send_photo(shot, f"{name}: horas -> {', '.join(horas[:6])}")
-            return (True, horas, fecha, shot, None)
-
-        if status == "no_citas":
-            if cfg.SEND_ALL_SHOTS and shot:
-                send_photo(shot, f"{name}: sin huecos (mensaje visible).")
-            return (False, [], fecha, None, None)
-
-        if status == "timeout":
-            if horas:
-                return (True, horas, fecha, shot, None)
-            notify(f"⏳ {name}: timeout. Sin horas.")
-            return (False, [], fecha, None, None)
-
-    return (False, [], None, None, last_block_msg or "blank")
-
-# -----------------------------
-# Anti-duplicado notificaciones
-# -----------------------------
-def sig_from_hours(hours: List[str]) -> str:
-    return hashlib.sha256(",".join(sorted(hours)).encode("utf-8")).hexdigest()
-
-# -----------------------------
+# ========================
 # Main loop
-# -----------------------------
-def main() -> None:
-    consulados = parse_consul_list(cfg.CONSUL_URLS)
-    proxies = parse_proxies(cfg.PROXY_LIST)
-
-    print("[INFO] Consulados:", ", ".join([f"{n}({m})" for (n, _, m) in consulados]), flush=True)
-    if proxies:
-        print(f"[INFO] Proxies cargados: {len(proxies)} (rotacion={'ON' if cfg.ROTATE_PROXY_EACH_ROUND else 'OFF'})", flush=True)
-
+# ========================
+def main():
+    consulados = parse_consul_list(CONSUL_URLS)
     if not consulados:
-        print("[ERROR] CONSUL_URLS vacio.", flush=True)
+        print("[ERROR] CONSUL_URLS vacío o mal formateado.", flush=True)
         sys.exit(1)
+
+    print("[INFO] Consulados:", ", ".join(f"{n}({m})" for n,_,m in consulados), flush=True)
+    if PROXY_LIST:
+        print(f"[INFO] Proxies cargados: {len(PROXY_LIST)} (uso SOLO si hay bloqueo).", flush=True)
 
     last_sig: Dict[str, str] = {}
 
     while True:
         try:
-            for (name, url, modo) in consulados:
-                ok, horas, fecha, shot, block_msg = revisar_un_consulado(name, url, modo, True, proxies)
+            for (name, url, mode) in consulados:
+                ok, hours, fecha, shot, block = revisar_un_consulado(name, url, mode)
 
-                if block_msg:
-                    # ya se notifico el detalle del bloqueo
-                    continue
+                if block == "blank":
+                    notify(f"⚠️ {name}: página vacía tras reintentos (bloqueo probable).")
 
-                if ok and horas:
-                    sig = sig_from_hours(horas)
+                if ok and hours:
+                    sig = slots_signature(hours)
                     if last_sig.get(name) == sig:
                         continue
                     last_sig[name] = sig
-                    primeras = ", ".join(horas[:6])
+                    primeras = ", ".join(sorted(hours)[:6])
                     f = f" ({fecha})" if fecha else ""
-                    msg = f"✅ {name}: HAY HUECOS{f} -> Horas: {primeras}\nEntra: {url}"
+                    msg = f"✅ ¡HAY HUECOS en {name}!{f}\nHoras: {primeras}\nEntra: {url}"
                     notify(msg)
-                    if shot:
+                    if shot and (SEND_ALL_SHOTS or DEBUG_SHOT):
                         send_photo(shot, msg)
-                    time.sleep(45)  # anti spam basico
                 else:
                     marca = time.strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"[{marca}] {name} -> sin huecos por ahora.", flush=True)
+                    print(f"[{marca}] {name} → sin huecos por ahora.", flush=True)
 
-            wait = random.randint(max(35, cfg.CHECK_INTERVAL_SEC - 15), cfg.CHECK_INTERVAL_SEC + 40)
-            print(f"[INFO] Esperando {wait}s antes de la proxima ronda...", flush=True)
+            # Espera aleatoria (ahorra datos)
+            wait = random.randint(max(60, CHECK_INTERVAL_SEC - 15), CHECK_INTERVAL_SEC + 40)
+            print(f"[INFO] Esperando {wait}s antes de la siguiente ronda…", flush=True)
             time.sleep(wait)
 
         except Exception as e:
