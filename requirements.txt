@@ -1,2 +1,5 @@
-playwright==1.44.1
-requests>=2.31.0,<3
+pip>=24.0
+setuptools>=70
+wheel>=0.42
+requests>=2.31,<3
+playwright==1.47.0
