@@ -1,12 +1,15 @@
 #!/bin/bash
 set -e
 
-# Instalar Chromium y dependencias de sistema para Playwright
+echo "[start] Instalando Playwright + Chromium y dependencias del sistema…"
+# Intento 1: todo en un paso (con --with-deps)
 python -m playwright install --with-deps chromium || (
-  # fallback si el flag --with-deps falla en el entorno
+  # Fallback por si el entorno no acepta --with-deps de una
+  echo "[start] Fallback: instalando deps del sistema y luego chromium…"
   python -m playwright install-deps chromium || true
   python -m playwright install chromium
 )
 
-# Ejecuta el bot
+echo "[start] Lanzando monitor…"
+# Ejecuta tu script (asegúrate que el nombre coincide)
 python monitor_citas_multiconsulados.py
