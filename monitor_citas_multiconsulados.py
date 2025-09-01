@@ -1,11 +1,9 @@
 # monitor_citas_multiconsulados.py
-# Bot para monitorear huecos en citaconsular.es (Bookitit) con:
-# - Modo stealth anti-detección
-# - Rotación de proxies (opcional)
-# - Detección robusta de horas visibles en página + iframes
-# - Capturas del iframe más grande (evita fotos “en blanco”)
-# - Regla anti-blank: NO ENVÍA fotos si la página/iframe no están realmente renderizados
-# - Avisos cuando parece bloqueo (página vacía / timeout)
+# Monitoreo de huecos en citaconsular.es (Bookitit) con:
+# - Stealth anti-detección
+# - Diagnóstico de bloqueo/IP + reintento con otro proxy
+# - Capturas inteligentes (evita fotos en blanco)
+# - Búsqueda robusta de HH:MM en página + iframes
 
 import os, sys, time, random, re, hashlib
 from dataclasses import dataclass
@@ -14,7 +12,7 @@ import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PTimeout
 
 # ─────────────────────────────────────────────────────────────
-# Configuración
+# Config
 # ─────────────────────────────────────────────────────────────
 @dataclass
 class Config:
@@ -37,11 +35,12 @@ class Config:
         ])
     )
 
-    DEBUG_SHOT: bool = os.getenv("DEBUG_SHOT", "0") == "1"          # guarda JPG en /tmp
-    SEND_ALL_SHOTS: bool = os.getenv("SEND_ALL_SHOTS", "0") == "1"  # intenta enviar todas las fotos (pero NUNCA si “blanco”)
+    DEBUG_SHOT: bool = os.getenv("DEBUG_SHOT", "0") == "1"
+    SEND_ALL_SHOTS: bool = os.getenv("SEND_ALL_SHOTS", "0") == "1"
 
     PROXY_LIST: str = os.getenv("PROXY_LIST", "").strip()
     ROTATE_PROXY_EACH_ROUND: bool = os.getenv("ROTATE_PROXY_EACH_ROUND", "1") == "1"
+    RETRIES_PER_SITE: int = int(os.getenv("RETRIES_PER_SITE", "2"))   # reintentos cuando hay “blank”
 
 cfg = Config()
 
@@ -74,7 +73,7 @@ def send_photo(path: str, caption: str = ""):
         print(f"[WARN] send_photo fallo: {e}", file=sys.stderr)
 
 # ─────────────────────────────────────────────────────────────
-# Anti-detección / humanización
+# Anti-detección / “humano”
 # ─────────────────────────────────────────────────────────────
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -82,7 +81,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4; rv:127.0) Gecko/20100101 Firefox/127.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
     "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
 ]
@@ -92,9 +90,9 @@ Object.defineProperty(navigator, 'webdriver', {get: () => false});
 Object.defineProperty(navigator, 'languages', {get: () => ['es-MX','es','en-US','en']});
 Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
 window.chrome = { runtime: {} };
-const oq = window.navigator.permissions && window.navigator.permissions.query;
+const oq = navigator.permissions && navigator.permissions.query;
 if (oq) {
-  window.navigator.permissions.query = (p) => (p.name === 'notifications'
+  navigator.permissions.query = (p) => (p.name === 'notifications'
     ? Promise.resolve({ state: 'granted' })
     : oq(p));
 }
@@ -246,27 +244,47 @@ def wait_calendar_ready(page, timeout_ms: int = 22000) -> str:
     return "timeout"
 
 # ─────────────────────────────────────────────────────────────
-# Anti “captura en blanco”: validación visual antes de fotografiar/enviar
+# Diagnóstico de bloqueo / red
 # ─────────────────────────────────────────────────────────────
+def _dump_network_on(context, bucket: list):
+    def on_response(resp):
+        try:
+            bucket.append((resp.url, resp.status))
+        except Exception:
+            pass
+    context.on("response", on_response)
+
+def _diagnose_page(page) -> dict:
+    info = {}
+    try:
+        info["url"] = page.url
+        info["text_len"] = len((page.evaluate("document.body && document.body.innerText") or "").strip())
+        info["html_len"] = len(page.content() or "")
+        ifr = page.locator("iframe")
+        n = ifr.count()
+        info["iframes_count"] = n
+        srcs = []
+        for i in range(min(n, 10)):
+            try:
+                el = ifr.nth(i)
+                if el.is_visible():
+                    srcs.append(el.get_attribute("src") or "(sin src)")
+            except Exception:
+                continue
+        info["iframe_srcs"] = srcs
+    except Exception as e:
+        info["diag_error"] = str(e)
+    return info
+
 def visual_ready_for_photo(page) -> bool:
-    """
-    Considera lista para foto si:
-    - Hay al menos 1 iframe VISIBLE con tamaño razonable (>= 300x300), o
-    - El body tiene suficiente texto (> 600 chars)
-    y la red está bastante tranquila.
-    """
     try:
         try:
             page.wait_for_load_state("networkidle", timeout=6000)
         except Exception:
             pass
-
-        # Texto visible del body
         body_txt = (visible_text(page) or "").strip()
         if len(body_txt) > 600:
             return True
-
-        # Iframe visible “grande”
         ifr = page.locator("iframe")
         n = ifr.count()
         for i in range(min(n, 20)):
@@ -275,9 +293,7 @@ def visual_ready_for_photo(page) -> bool:
                 if not el.is_visible():
                     continue
                 box = el.bounding_box()
-                if not box:
-                    continue
-                if box["width"] >= 300 and box["height"] >= 300:
+                if box and box["width"] >= 300 and box["height"] >= 300:
                     return True
             except Exception:
                 continue
@@ -285,7 +301,6 @@ def visual_ready_for_photo(page) -> bool:
         pass
     return False
 
-# Captura priorizando el iframe más grande
 def shoot_best_view(page, name: str, suffix: str) -> Optional[str]:
     try:
         ifr = page.locator("iframe")
@@ -308,30 +323,27 @@ def shoot_best_view(page, name: str, suffix: str) -> Optional[str]:
                 continue
         if biggest_i >= 0:
             el = ifr.nth(biggest_i)
-            path = f"/tmp/{name.replace(' ', '_').lower()}_{suffix}_iframe.jpg"
+            path = f"/tmp/{name.replace(' ', '').lower()}{suffix}_iframe.jpg"
             el.screenshot(path=path, type="jpeg", quality=75)
             return path
     except Exception:
         pass
     try:
-        path = f"/tmp/{name.replace(' ', '_').lower()}_{suffix}_page.jpg"
+        path = f"/tmp/{name.replace(' ', '').lower()}{suffix}_page.jpg"
         page.screenshot(path=path, type="jpeg", quality=75, full_page=True)
         return path
     except Exception:
         return None
 
 # ─────────────────────────────────────────────────────────────
-# Core revisión por consulado
+# Core revisión (1 intento)
 # ─────────────────────────────────────────────────────────────
-def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: bool = True,
-                         proxy_conf: Optional[dict] = None
-                         ) -> Tuple[bool, List[Tuple[str,str]], Optional[str], Optional[str], Optional[str]]:
+def _revisar_once(name: str, url: str, modo: str, headless: bool, proxy_conf: Optional[dict]) \
+        -> Tuple[str, List[Tuple[str,str]], Optional[str], Optional[str], Dict]:
     """
-    Retorna: (hay_huecos, slots, fecha, screenshot_path, bloqueo_msg)
+    Retorna: (status: 'hours'/'no_citas'/'timeout'/'blank', slots, fecha, shot_path, diag)
     """
-    shot_path = None
-    block_msg = None
-
+    diag_result: Dict = {"proxy": proxy_conf.get("server") if proxy_conf else None}
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=headless,
@@ -358,7 +370,11 @@ def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: b
         )
         context.add_init_script(STEALTH_JS)
 
-        # Aceptar alertas (Welcome/Bienvenido)
+        # network log
+        netlog = []
+        _dump_network_on(context, netlog)
+
+        # Dialogs (Welcome)
         def on_dialog(dialog):
             try:
                 dialog.accept()
@@ -369,7 +385,7 @@ def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: b
         page = context.new_page()
         page.set_default_timeout(25000)
 
-        # Gesto humano
+        # gesto humano
         try:
             page.mouse.move(random.randint(60, vw-60), random.randint(60, vh-60), steps=8)
         except Exception:
@@ -382,15 +398,14 @@ def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: b
             pass
         human_pause()
 
-        # Si se ve "vacío", probablemente bloqueo
-        if (visible_text(page).strip().__len__() < 8) and (len(page.content() or "") < 1500):
-            block_msg = f"⚠️ {name}: la página parece vacía (posible bloqueo por IP/anti-bot)."
-            if cfg.SEND_ALL_SHOTS and cfg.DEBUG_SHOT and visual_ready_for_photo(page):
-                maybe = shoot_best_view(page, name, "blank")
-                if maybe:
-                    send_photo(maybe, block_msg)
+        # ¿página vacía?
+        if (visible_text(page).strip()._len_() < 8) and (len(page.content() or "") < 1500):
+            diag = _diagnose_page(page)
+            bad = [(u,s) for (u,s) in netlog if s and s >= 400]
+            diag_result.update(diag)
+            diag_result["bad_responses"] = bad[:10]
             browser.close()
-            return (False, [], None, None, block_msg)
+            return ("blank", [], None, None, diag_result)
 
         # Flujo por modo
         if modo == "default":
@@ -422,7 +437,7 @@ def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: b
             except Exception:
                 pass
 
-        # Scroll + micro movimientos
+        # micromovimiento
         try:
             page.mouse.wheel(0, random.randint(120, 420))
             human_pause()
@@ -431,49 +446,105 @@ def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: b
             pass
 
         status = wait_calendar_ready(page, timeout_ms=22000)
+        fecha = find_date_text(page)
 
         if status == "hours":
-            time.sleep(0.5)
             horas = find_time_nodes_anywhere(page)
             slots = [(h, f"Hora {h}") for h in horas]
-            fecha = find_date_text(page)
-
-            # Anti-blank: solo fotografiar/enviar si realmente está renderizado
+            shot = None
             if visual_ready_for_photo(page):
-                time.sleep(0.4)
-                shot_path = shoot_best_view(page, name, "citas")
-                if cfg.SEND_ALL_SHOTS and shot_path:
-                    send_photo(shot_path, f"📸 {name}: horas detectadas → {', '.join(horas)}")
-            else:
-                notify(f"ℹ️ {name}: horas detectadas pero vista no renderizada aún (evité enviar foto).")
-
+                shot = shoot_best_view(page, name, "citas")
             browser.close()
-            return (True, slots, fecha, shot_path, None)
+            return ("hours", slots, fecha, shot, diag_result)
 
         if status == "no_citas":
-            fecha = find_date_text(page)
-            # Enviar captura SOLO si está renderizado
+            shot = None
             if cfg.SEND_ALL_SHOTS and visual_ready_for_photo(page):
-                time.sleep(0.4)
-                no_shot = shoot_best_view(page, name, "no_citas")
-                if no_shot:
-                    send_photo(no_shot, f"📸 {name}: sin huecos (mensaje visible).")
+                shot = shoot_best_view(page, name, "no_citas")
             browser.close()
-            return (False, [], fecha, None, None)
+            return ("no_citas", [], fecha, shot, diag_result)
 
         # timeout
-        fecha = find_date_text(page)
         horas = find_time_nodes_anywhere(page)
         slots = [(h, f"Hora {h}") for h in horas]
+        shot = None
         if cfg.SEND_ALL_SHOTS and visual_ready_for_photo(page):
-            time.sleep(0.4)
-            timeout_shot = shoot_best_view(page, name, "timeout")
-            if timeout_shot:
-                send_photo(timeout_shot, f"⏳ {name}: timeout. Horas detectadas: {', '.join(horas) or 'ninguna'}")
-        else:
-            notify(f"⏳ {name}: timeout (vista no lista; no se envía foto).")
+            shot = shoot_best_view(page, name, "timeout")
         browser.close()
-        return (bool(slots), slots, fecha, None, None)
+        return ("timeout", slots, fecha, shot, diag_result)
+
+# ─────────────────────────────────────────────────────────────
+# Revisión con reintentos (rota proxy si hay “blank”)
+# ─────────────────────────────────────────────────────────────
+def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: bool = True,
+                         proxies: Optional[List[str]] = None) \
+                         -> Tuple[bool, List[Tuple[str,str]], Optional[str], Optional[str], Optional[str]]:
+    retries = max(0, cfg.RETRIES_PER_SITE)
+    # primer intento: sin proxy (o uno aleatorio si ROTATE_PROXY_EACH_ROUND)
+    attempt_proxies: List[Optional[dict]] = []
+
+    if proxies and cfg.ROTATE_PROXY_EACH_ROUND:
+        attempt_proxies.append(choose_proxy(proxies))
+    else:
+        attempt_proxies.append(None)
+
+    # reintentos: forzar distintos proxies
+    for _ in range(retries):
+        if proxies:
+            attempt_proxies.append(choose_proxy(proxies))
+        else:
+            attempt_proxies.append(None)
+
+    last_block_msg = None
+    for idx, proxy_conf in enumerate(attempt_proxies, 1):
+        status, slots, fecha, shot, diag = _revisar_once(name, url, modo, headless, proxy_conf)
+
+        # logs de IP pública a veces (10% de las veces)
+        if random.random() < 0.1:
+            try:
+                ip = requests.get("https://api.ipify.org", timeout=5).text
+                print(f"[INFO] IP pública actual: {ip}", flush=True)
+            except Exception:
+                pass
+
+        if status == "blank":
+            # diagnóstico enriquecido
+            bad = diag.get("bad_responses", [])
+            msg = (
+                f"⚠ {name}: página parece vacía (posible bloqueo).\n"
+                f"- Proxy: {diag.get('proxy')}\n"
+                f"- iframes: {diag.get('iframes_count')} (ej: {', '.join(diag.get('iframe_srcs', [])[:3])})\n"
+                f"- text_len: {diag.get('text_len')}  html_len: {diag.get('html_len')}\n"
+                f"- respuestas ≥400: {len(bad)}"
+            )
+            for (u,s) in bad[:5]:
+                msg += f"\n  · {s} → {u[:120]}"
+            notify(msg)
+            last_block_msg = msg
+            # si hay más intentos, seguimos probando con otro proxy
+            continue
+
+        # éxito o resultado válido
+        if status == "hours":
+            if cfg.SEND_ALL_SHOTS and shot:
+                send_photo(shot, f"📸 {name}: horas detectadas → {', '.join(sorted({h for h,_ in slots}))}")
+            return (True, slots, fecha, shot, None)
+
+        if status == "no_citas":
+            if cfg.SEND_ALL_SHOTS and shot:
+                send_photo(shot, f"📸 {name}: sin huecos (mensaje visible).")
+            return (False, [], fecha, None, None)
+
+        # timeout con o sin horas detectadas
+        if slots:
+            # si encontró horas durante el timeout, igual notificamos
+            return (True, slots, fecha, shot, None)
+        else:
+            notify(f"⏳ {name}: timeout. Sin horas.")
+            return (False, [], fecha, None, None)
+
+    # si todos fueron “blank”
+    return (False, [], None, None, last_block_msg or "blank")
 
 # ─────────────────────────────────────────────────────────────
 # Anti-spam de notificaciones
@@ -505,18 +576,12 @@ def main():
     while True:
         try:
             for (name, url, modo) in consulados:
-                proxy_conf = None
-                if proxies:
-                    proxy_conf = choose_proxy(proxies) if cfg.ROTATE_PROXY_EACH_ROUND else (choose_proxy(proxies) if random.random() < 0.33 else None)
-                    if proxy_conf:
-                        print(f"[INFO] {name}: usando proxy {proxy_conf.get('server')}", flush=True)
-
                 ok, slots, fecha, shot, block_msg = revisar_un_consulado(
-                    name, url, modo, headless=True, proxy_conf=proxy_conf
+                    name, url, modo, headless=True, proxies=proxies
                 )
 
                 if block_msg:
-                    notify(block_msg)
+                    # ya se notificó dentro; aquí solo seguimos
                     continue
 
                 if ok and slots:
@@ -530,7 +595,7 @@ def main():
                     notify(caption)
                     if shot and os.path.exists(shot):
                         send_photo(shot, caption)
-                    time.sleep(45)
+                    time.sleep(45)  # anti-spam simple
                 else:
                     marca = time.strftime("%Y-%m-%d %H:%M:%S")
                     print(f"[{marca}] {name} → Sin huecos reales por ahora.", flush=True)
@@ -547,7 +612,7 @@ def main():
             time.sleep(120)
 
 # ─────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+if _name_ == "_main_":
     headed = len(sys.argv) > 1 and sys.argv[1].lower().startswith("head")
     if headed:
         print("Headed demo de CDMX…")
@@ -556,7 +621,7 @@ if __name__ == "__main__":
             "https://www.citaconsular.es/es/hosteds/widgetdefault/21b7c1aaf9fef2785deb64ccab5ceca06/",
             "cdmx_panel",
             headless=False,
-            proxy_conf=None
+            proxies=parse_proxies(cfg.PROXY_LIST)
         ))
     else:
-        main()
+        main()
