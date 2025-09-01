@@ -16,8 +16,8 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Intervalo por defecto subido a 120s para ahorrar datos
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "120"))
-HUMAN_MIN = float(os.getenv("HUMAN_MIN", "0.7"))
-HUMAN_MAX = float(os.getenv("HUMAN_MAX", "1.5"))
+HUMAN_MIN = float(os.getenv("HUMAN_MIN", "2.5"))
+HUMAN_MAX = float(os.getenv("HUMAN_MAX", "5.5"))
 
 # Enviar fotos solo cuando valen la pena. Si pones 1, también enviará "no_citas" y "timeout"
 SEND_ALL_SHOTS = os.getenv("SEND_ALL_SHOTS", "0") == "1"
