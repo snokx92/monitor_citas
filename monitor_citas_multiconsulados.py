@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Monitor de citas (Monterrey + Ciudad de México)
-- CDMX usa "click extra" sobre el panel de normas para desplegar el calendario.
-- Envío a Telegram solo cuando hay huecos (con captura).
-- Anti-bloqueo: si la página llega "vacía", reintenta con proxy (si hay PROXY_LIST).
-- Logs detallados para confirmar cada paso.
+Monitor de citas (Monterrey + Ciudad de México, sin Miami)
+- CDMX: click extra sobre el panel de normas.
+- Detección por HH:MM y por “Hueco libre” (fallback si no se ve hora).
+- Modo PRUEBA (--probe "Ciudad de Mexico"): vídeo, HTML y capturas, en móvil.
+- En producción: opción PROOF_ON_NO_SLOTS=1 para adjuntar prueba cuando diga “sin huecos”.
+- Anti-bloqueo: si body/html muy cortos => “blank” (posible bloqueo) + reintentos con proxy (si hay).
 
-Requiere:
+Requisitos:
   pip install playwright requests
   python -m playwright install --with-deps chromium
 """
 
-import os, sys, time, random, re, hashlib
+import os, sys, time, random, re, hashlib, json
 from typing import List, Optional, Tuple, Dict
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PTimeout
@@ -22,26 +23,27 @@ from playwright.sync_api import sync_playwright, TimeoutError as PTimeout
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Intervalo entre rondas (segundos) — usar >=120 para ahorrar datos
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "120"))
-
-# Pausas humanas cortas entre acciones
 HUMAN_MIN = float(os.getenv("HUMAN_MIN", "0.7"))
-HUMAN_MAX = float(os.getenv("HUMAN_MAX", "1.5"))
+HUMAN_MAX = float(os.getenv("HUMAN_MAX", "1.6"))
 
-# Ahorro de datos (si ves páginas “rotas”, pon BLOCK_IMAGES=0)
-BLOCK_IMAGES = os.getenv("BLOCK_IMAGES", "1") == "1"
+# Ahorro de datos (en pruebas RECOMIENDO poner 0)
+BLOCK_IMAGES = os.getenv("BLOCK_IMAGES", "0") == "1"
 BLOCK_FONTS  = os.getenv("BLOCK_FONTS", "1") == "1"
 
-# Debug opcional
-DEBUG_STEPS       = os.getenv("DEBUG_STEPS", "1") == "1"   # logs paso a paso
-TRACE_PLAYWRIGHT  = os.getenv("TRACE_PLAYWRIGHT", "0") == "1"  # genera trace.zip ante "blank"
+# Pruebas / evidencias
+DEBUG_STEPS       = os.getenv("DEBUG_STEPS", "1") == "1"
+TRACE_PLAYWRIGHT  = os.getenv("TRACE_PLAYWRIGHT", "0") == "1"
+PROOF_ON_NO_SLOTS = os.getenv("PROOF_ON_NO_SLOTS", "1") == "1"  # en prod: adjunta prueba si “no_citas”
 
-# Proxies (solo se usan si detectamos bloqueo/“blank”)
+# Proxies (solo si blank)
 PROXY_LIST = [s.strip() for s in os.getenv("PROXY_LIST", "").split(",") if s.strip()]
 RETRIES_ON_BLOCK = int(os.getenv("RETRIES_ON_BLOCK", "2"))
 
-# SOLO Monterrey + CDMX (sin Miami)
+# Modo móvil específico para CDMX
+CDMX_MOBILE = os.getenv("CDMX_MOBILE", "1") == "1"
+
+# Consulados (solo Mty + CDMX)
 CONSUL_URLS = ",".join([
     "Monterrey|https://www.citaconsular.es/es/hosteds/widgetdefault/25b18886db70f7ec9fd6dfd1a85d1395f/|default",
     "Ciudad de Mexico|https://www.citaconsular.es/es/hosteds/widgetdefault/21b7c1aaf9fef2785deb64ccab5ceca06/|cdmx_panel",
@@ -50,13 +52,13 @@ CONSUL_URLS = ",".join([
 # =========================
 # Utilidades
 # =========================
-USER_AGENTS = [
+USER_AGENTS_DESKTOP = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
 ]
+UA_IPHONE = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', {get: () => false});
 Object.defineProperty(navigator, 'languages', {get: () => ['es-MX','es','en-US','en']});
@@ -147,45 +149,75 @@ def visible_text(page) -> str:
     except Exception:
         return ""
 
-def find_time_nodes_anywhere(page) -> List[str]:
-    horas = set()
-    # main
-    try:
-        times = page.locator(r"text=/\b([01]?\d|2[0-3]):[0-5]\d\b/")
-        n = times.count()
-        for i in range(min(n, 600)):
-            try:
-                node = times.nth(i)
-                if not node.is_visible():
+def nodes_with_hueco_libre_anywhere(page) -> List[str]:
+    """Devuelve lista de textos de botones/elementos que contengan Hueco libre (en main y iframes)."""
+    textos = []
+    css = 'text=/Hueco\\s+libre/i, button:has-text("Hueco libre"), .btn:has-text("Hueco libre")'
+    def scan(scope):
+        try:
+            loc = scope.locator(css)
+            n = loc.count()
+            for i in range(min(n, 300)):
+                try:
+                    el = loc.nth(i)
+                    if not el.is_visible():
+                        continue
+                    txt = (el.inner_text() or "").strip()
+                    if txt:
+                        textos.append(txt)
+                except Exception:
                     continue
-                txt = (node.inner_text() or "").strip()
-                m = TIME_RE.search(txt)
-                if m:
-                    horas.add(m.group(0))
-            except Exception:
-                continue
-    except Exception:
-        pass
-    # iframes
+        except Exception:
+            pass
+    scan(page)
     try:
         for fr in page.frames:
             if fr == page.main_frame:
                 continue
-            times = fr.locator(r"text=/\b([01]?\d|2[0-3]):[0-5]\d\b/")
+            scan(fr)
+    except Exception:
+        pass
+    return textos
+
+def find_time_nodes_anywhere(page) -> List[str]:
+    horas = set()
+    # por regex HH:MM
+    def scan(scope):
+        try:
+            times = scope.locator(r"text=/\b([01]?\d|2[0-3]):[0-5]\d\b/")
             n = times.count()
             for i in range(min(n, 600)):
                 try:
-                    node = times.nth(i)
-                    if not node.is_visible():
+                    el = times.nth(i)
+                    if not el.is_visible():
                         continue
-                    txt = (node.inner_text() or "").strip()
+                    txt = (el.inner_text() or "").strip()
                     m = TIME_RE.search(txt)
                     if m:
                         horas.add(m.group(0))
                 except Exception:
                     continue
+        except Exception:
+            pass
+    scan(page)
+    try:
+        for fr in page.frames:
+            if fr == page.main_frame:
+                continue
+            scan(fr)
     except Exception:
         pass
+
+    # si encontró Hueco libre pero no hora, intenta rescatar hora del mismo texto
+    if not horas:
+        huecos = nodes_with_hueco_libre_anywhere(page)
+        for t in huecos:
+            m = TIME_RE.search(t)
+            if m:
+                horas.add(m.group(0))
+        # si sigue sin hora pero hay Hueco libre, agrega un placeholder
+        if huecos and not horas:
+            horas.add("Hueco libre (sin hora)")
     return sorted(horas)
 
 def page_has_no_citas_visible(page) -> bool:
@@ -218,11 +250,12 @@ def page_has_no_citas_visible(page) -> bool:
         pass
     return False
 
-def wait_calendar_ready(page, timeout_ms: int = 30000) -> str:
+def wait_calendar_ready(page, timeout_ms: int = 45000) -> str:
     """Devuelve: 'hours' | 'no_citas' | 'timeout'."""
     deadline = time.time() + (timeout_ms / 1000.0)
     while time.time() < deadline:
-        if find_time_nodes_anywhere(page):
+        hrs = find_time_nodes_anywhere(page)
+        if hrs:
             return "hours"
         if page_has_no_citas_visible(page):
             return "no_citas"
@@ -230,12 +263,11 @@ def wait_calendar_ready(page, timeout_ms: int = 30000) -> str:
     return "timeout"
 
 def shoot_best_view(page, name: str, suffix: str) -> Optional[str]:
-    # Prioriza el iframe más grande
     try:
         ifr = page.locator("iframe")
         n = ifr.count()
-        biggest_i = -1
-        biggest_area = 0
+        best_i = -1
+        best_area = 0
         for i in range(min(n, 20)):
             try:
                 el = ifr.nth(i)
@@ -245,22 +277,31 @@ def shoot_best_view(page, name: str, suffix: str) -> Optional[str]:
                 if not box:
                     continue
                 area = box["width"] * box["height"]
-                if area > biggest_area:
-                    biggest_area = area
-                    biggest_i = i
+                if area > best_area:
+                    best_area = area
+                    best_i = i
             except Exception:
                 continue
-        if biggest_i >= 0:
-            el = ifr.nth(biggest_i)
+        if best_i >= 0:
+            el = ifr.nth(best_i)
             path = f"/tmp/{name.replace(' ', '_').lower()}_{suffix}_iframe.jpg"
             el.screenshot(path=path, type="jpeg", quality=70)
             return path
     except Exception:
         pass
-    # Página completa
     try:
         path = f"/tmp/{name.replace(' ', '_').lower()}_{suffix}_page.jpg"
         page.screenshot(path=path, type="jpeg", quality=70, full_page=True)
+        return path
+    except Exception:
+        return None
+
+def dump_html(page, name: str, suffix: str) -> Optional[str]:
+    try:
+        html = page.content() or ""
+        path = f"/tmp/{name.replace(' ', '_').lower()}_{suffix}.html"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
         return path
     except Exception:
         return None
@@ -271,27 +312,41 @@ def slots_signature(hours: List[str]) -> str:
 # =========================
 # Playwright context
 # =========================
-def _open_context(p, proxy_conf: Optional[dict]):
-    browser = p.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--hide-scrollbars",
-            "--disable-gpu",
-        ],
-        proxy=proxy_conf
-    )
-    ua = random.choice(USER_AGENTS)
-    vw = random.randint(1200, 1440)
-    vh = random.randint(800, 960)
-    context = browser.new_context(
-        viewport={"width": vw, "height": vh},
-        user_agent=ua,
-        locale="es-ES",
-        extra_http_headers={"Accept-Language": "es-MX,es;q=0.9,en;q=0.8"},
-    )
+def _open_context(p, proxy_conf: Optional[dict], mobile: bool, record_video: bool):
+    browser_args = [
+        "--no-sandbox", "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage", "--hide-scrollbars", "--disable-gpu",
+    ]
+    context_kwargs = {}
+    if record_video:
+        context_kwargs["record_video_dir"] = "/tmp"
+
+    browser = p.chromium.launch(headless=True, args=browser_args, proxy=proxy_conf)
+
+    if mobile:
+        # iPhone-ish
+        context = browser.new_context(
+            viewport={"width": 390, "height": 800},
+            user_agent=UA_IPHONE,
+            device_scale_factor=3,
+            is_mobile=True,
+            has_touch=True,
+            locale="es-ES",
+            extra_http_headers={"Accept-Language": "es-MX,es;q=0.9,en;q=0.8"},
+            **context_kwargs
+        )
+    else:
+        ua = random.choice(USER_AGENTS_DESKTOP)
+        vw = random.randint(1200, 1440)
+        vh = random.randint(800, 960)
+        context = browser.new_context(
+            viewport={"width": vw, "height": vh},
+            user_agent=ua,
+            locale="es-ES",
+            extra_http_headers={"Accept-Language": "es-MX,es;q=0.9,en;q=0.8"},
+            **context_kwargs
+        )
+
     context.add_init_script(STEALTH_JS)
 
     if BLOCK_IMAGES or BLOCK_FONTS:
@@ -327,14 +382,16 @@ def _open_context(p, proxy_conf: Optional[dict]):
 # =========================
 # Una pasada (posible proxy)
 # =========================
-def revisar_once(name: str, url: str, mode: str, proxy_conf: Optional[dict]) -> Tuple[str, List[str], Optional[str], Optional[str]]:
+def revisar_once(name: str, url: str, mode: str, proxy_conf: Optional[dict], proof_mode: bool=False) -> Tuple[str, List[str], Optional[str], Optional[str]]:
     """
     return: (status, hours, fecha, shot)
       status: "hours" | "no_citas" | "timeout" | "blank"
-      shot: ruta a screenshot (solo se usa al notificar huecos)
+      shot: ruta a screenshot (cuando hay huecos)
     """
+    mobile = (mode == "cdmx_panel" and CDMX_MOBILE)
+    record_video = proof_mode
     with sync_playwright() as p:
-        browser, context, page = _open_context(p, proxy_conf)
+        browser, context, page = _open_context(p, proxy_conf, mobile=mobile, record_video=record_video)
 
         log_step(f"[{name}] goto…")
         page.goto(url, wait_until="domcontentloaded")
@@ -344,12 +401,20 @@ def revisar_once(name: str, url: str, mode: str, proxy_conf: Optional[dict]) -> 
             pass
         human_pause()
 
-        # Detección de "página vacía"
         body_txt = (visible_text(page) or "").strip()
         html_len = len(page.content() or "")
         log_step(f"[{name}] text_len={len(body_txt)} html_len={html_len}")
+
+        if proof_mode:
+            dump_html(page, name, "before")
+            shoot_best_view(page, name, "before")
+
+        # Página vacía => blank
         if len(body_txt) < 8 and html_len < 1500:
             status = "blank"
+            if proof_mode:
+                dump_html(page, name, "blank")
+                shoot_best_view(page, name, "blank")
             if TRACE_PLAYWRIGHT:
                 try:
                     tpath = f"/tmp/trace_{name.replace(' ', '_').lower()}_{int(time.time())}.zip"
@@ -357,6 +422,7 @@ def revisar_once(name: str, url: str, mode: str, proxy_conf: Optional[dict]) -> 
                     send_document(tpath, f"{name}: trace (blank/bloqueo)")
                 except Exception:
                     pass
+            _finish_media_send(context, name, proof_mode)
             browser.close()
             return (status, [], None, None)
 
@@ -375,6 +441,9 @@ def revisar_once(name: str, url: str, mode: str, proxy_conf: Optional[dict]) -> 
                 except Exception:
                     pass
                 log_step(f"[{name}] Continue OK → esperando calendario…")
+                if proof_mode:
+                    shoot_best_view(page, name, "after_continue")
+                    dump_html(page, name, "after_continue")
             except PTimeout:
                 log_step(f"[{name}] no apareció el botón Continue (posible ya adentro).")
         elif mode == "cdmx_panel":
@@ -393,59 +462,85 @@ def revisar_once(name: str, url: str, mode: str, proxy_conf: Optional[dict]) -> 
                     except Exception:
                         pass
                     log_step(f"[{name}] CDMX: click panel → esperando calendario…")
+                    if proof_mode:
+                        shoot_best_view(page, name, "after_panel")
+                        dump_html(page, name, "after_panel")
                 else:
                     log_step(f"[{name}] CDMX: no se encontró panel (no click extra).")
             except Exception as e:
                 log_step(f"[{name}] CDMX: error en click panel: {e}")
 
-        status = wait_calendar_ready(page, timeout_ms=30000)
-        fecha = None  # si luego quieres parsear fecha, colócala aquí
+        status = wait_calendar_ready(page, timeout_ms=45000)
+        fecha = None
 
         if status == "hours":
             hours = find_time_nodes_anywhere(page)
-            # Solo enviamos captura cuando hay huecos
             shot = shoot_best_view(page, name, "citas")
-            if TRACE_PLAYWRIGHT:
-                try:
-                    context.tracing.stop()  # sin adjuntar
-                except Exception:
-                    pass
+            _finish_media_send(context, name, proof_mode)
             browser.close()
             return ("hours", hours, fecha, shot)
 
         if status == "no_citas":
-            if TRACE_PLAYWRIGHT:
-                try:
-                    context.tracing.stop()
-                except Exception:
-                    pass
+            # pruebas opcionales en producción
+            if PROOF_ON_NO_SLOTS or proof_mode:
+                dump_html(page, name, "nocitas")
+                shoot_best_view(page, name, "nocitas")
+            _finish_media_send(context, name, proof_mode)
             browser.close()
             return ("no_citas", [], fecha, None)
 
         # timeout
         hours = find_time_nodes_anywhere(page)
-        if TRACE_PLAYWRIGHT:
-            try:
-                context.tracing.stop()
-            except Exception:
-                pass
-        browser.close()
         if hours:
-            # Si encontró horas justo al final, notifícalas
-            return ("hours", hours, fecha, shoot_best_view(page, name, "citas"))
+            shot = shoot_best_view(page, name, "citas")
+            _finish_media_send(context, name, proof_mode)
+            browser.close()
+            return ("hours", hours, fecha, shot)
+
+        if proof_mode:
+            dump_html(page, name, "timeout")
+            shoot_best_view(page, name, "timeout")
+        _finish_media_send(context, name, proof_mode)
+        browser.close()
         return ("timeout", [], fecha, None)
 
+def _finish_media_send(context, name: str, proof_mode: bool) -> None:
+    """Adjunta vídeo y/o trace al terminar en modo prueba."""
+    if proof_mode:
+        try:
+            for v in context.pages[0].video.path():
+                pass  # solo para asegurar que existe
+        except Exception:
+            pass
+        try:
+            # Envío de video (si existe)
+            for page in context.pages:
+                try:
+                    vpath = page.video.path()
+                    if vpath and os.path.exists(vpath):
+                        send_document(vpath, f"{name}: video prueba")
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    if TRACE_PLAYWRIGHT:
+        try:
+            context.tracing.stop()
+        except Exception:
+            pass
+
 # =========================
-# Orquestador (usa proxy solo si hace falta)
+# Orquestador con proxy si blank
 # =========================
-def revisar_un_consulado(name: str, url: str, mode: str) -> Tuple[bool, List[str], Optional[str], Optional[str], Optional[str]]:
-    status, hours, fecha, shot = revisar_once(name, url, mode, proxy_conf=None)
-    if status == "blank" and PROXY_LIST and RETRIES_ON_BLOCK > 0:
+def revisar_un_consulado(name: str, url: str, mode: str, proof_mode: bool=False) -> Tuple[bool, List[str], Optional[str], Optional[str], Optional[str]]:
+    status, hours, fecha, shot = revisar_once(name, url, mode, proxy_conf=None, proof_mode=proof_mode)
+    if status == "blank" and PROXY_LIST and RETRIES_ON_BLOCK > 0 and not proof_mode:
         notify(f"⚠️ {name}: página vacía (posible bloqueo). Reintentando con proxy…")
         attempts = min(RETRIES_ON_BLOCK, len(PROXY_LIST))
         for _ in range(attempts):
             proxy = choose_proxy(PROXY_LIST)
-            status, hours, fecha, shot = revisar_once(name, url, mode, proxy_conf=proxy)
+            status, hours, fecha, shot = revisar_once(name, url, mode, proxy_conf=proxy, proof_mode=False)
             if status != "blank":
                 break
 
@@ -458,9 +553,9 @@ def revisar_un_consulado(name: str, url: str, mode: str) -> Tuple[bool, List[str
     return (False, [], None, None, "blank")
 
 # =========================
-# Bucle principal
+# Bucle / Probe
 # =========================
-def main():
+def main_loop():
     consulados = parse_consul_list(CONSUL_URLS)
     if not consulados:
         print("[ERROR] No hay consulados configurados.", flush=True)
@@ -471,11 +566,10 @@ def main():
         print(f"[INFO] Proxies configurados: {len(PROXY_LIST)} (solo si hay bloqueo).", flush=True)
 
     last_sig: Dict[str, str] = {}
-
     while True:
         try:
             for (name, url, mode) in consulados:
-                ok, hours, fecha, shot, block = revisar_un_consulado(name, url, mode)
+                ok, hours, fecha, shot, block = revisar_un_consulado(name, url, mode, proof_mode=False)
 
                 if block == "blank":
                     notify(f"⚠️ {name}: página vacía tras reintentos (bloqueo probable).")
@@ -489,7 +583,7 @@ def main():
                     f = f" ({fecha})" if fecha else ""
                     msg = f"✅ ¡HAY HUECOS en {name}!{f}\nHoras: {primeras}\nEntra: {url}"
                     notify(msg)
-                    if shot:  # captura SOLO cuando hay huecos
+                    if shot:
                         send_photo(shot, msg)
                 else:
                     marca = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -503,5 +597,31 @@ def main():
             print(f"[ERROR] loop: {e}", flush=True)
             time.sleep(120)
 
+def probe_one(target_name: str):
+    print(f"[PROBE] Arrancando modo prueba para: {target_name}", flush=True)
+    consulados = parse_consul_list(CONSUL_URLS)
+    info = [c for c in consulados if c[0].lower() == target_name.lower()]
+    if not info:
+        print(f"[PROBE] No encontré '{target_name}'. Opciones: " + ", ".join(n for n,_,_ in consulados), flush=True)
+        sys.exit(1)
+    name, url, mode = info[0]
+    # En modo prueba NO usamos proxies; queremos ver qué pasa directo.
+    ok, hours, fecha, shot, block = revisar_un_consulado(name, url, mode, proof_mode=True)
+    if block == "blank":
+        notify(f"⚠️ [PRUEBA] {name}: página vacía (bloqueo probable). Se adjuntó evidencia.")
+    elif ok and hours:
+        msg = f"✅ [PRUEBA] ¡HAY HUECOS en {name}! Horas: {', '.join(hours[:6])}\n{url}"
+        notify(msg)
+        if shot:
+            send_photo(shot, msg)
+    else:
+        notify(f"ℹ️ [PRUEBA] {name}: no se detectaron huecos. Se adjuntó evidencia para verificar.")
+
 if __name__ == "__main__":
-    main()
+    # Uso:
+    #  - Producción (Railway): python monitor_citas_multiconsulados.py
+    #  - Prueba 1 consulado (con video/html/capturas): python monitor_citas_multiconsulados.py --probe "Ciudad de Mexico"
+    if len(sys.argv) >= 3 and sys.argv[1] == "--probe":
+        probe_one(sys.argv[2])
+    else:
+        main_loop()
