@@ -14,7 +14,7 @@ class Config:
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID: str   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # Intervalo base entre rondas completas (segundos)
+    # Intervalo base entre rondas (segundos)
     CHECK_INTERVAL_SEC: int = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
 
     # Pausas tipo humano
@@ -23,12 +23,11 @@ class Config:
 
     # Selectores / textos comunes
     SELECTOR_CONTINUE: str = 'button.btn.btn-success, button:has-text("Continue"), button:has-text("Continuar")'
-    BUTTON_CANDIDATES: str = "button, .btn, [role=button], a"
     DIA_REGEX: str         = r"(Lunes|Martes|Miércoles|Jueves|Viernes|Sábado|Domingo).*?\b\d{4}\b"
 
-    # Lista de consulados por ENV
-    #   Nombre|URL                → modo "default"
-    #   Nombre|URL|cdmx_panel     → modo CDMX (click al cuadro)
+    # Lista de consulados (Nombre|URL|modo)
+    # modo: default  → botón "Continuar"
+    #       cdmx_panel → click al panel de aviso
     CONSUL_URLS: str = os.getenv(
         "CONSUL_URLS",
         ",".join([
@@ -75,12 +74,14 @@ def send_photo(path: str, caption: str = ""):
 # Anti-detección
 # ─────────────────────────────────────────────────────────────
 USER_AGENTS = [
+    # Desktop
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4; rv:127.0) Gecko/20100101 Firefox/127.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    # Mobile
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
     "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
 ]
@@ -88,16 +89,16 @@ def human_pause():
     time.sleep(random.uniform(cfg.HUMAN_MIN, cfg.HUMAN_MAX))
 
 # ─────────────────────────────────────────────────────────────
-# Parsers y señales
+# Utilidades de parsing / señales
 # ─────────────────────────────────────────────────────────────
 TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
 
-# Mensajes inequívocos de “no hay” (se evalúan sobre TEXTO VISIBLE, no HTML)
+# Mensajes “no hay” (se validan solo si el elemento es VISIBLE)
 NO_CITAS_PATTERNS = [
-    r"No hay horas disponibles",
-    r"No hay citas disponibles",
-    r"No hay disponibilidad",
-    r"Inténtelo de nuevo dentro de unos días",
+    "No hay horas disponibles",
+    "No hay citas disponibles",
+    "No hay disponibilidad",
+    "Inténtelo de nuevo dentro de unos días",
 ]
 
 def visible_text(page) -> str:
@@ -108,122 +109,110 @@ def visible_text(page) -> str:
 
 def find_date_text(page) -> Optional[str]:
     try:
-        content = (page.content() or "").strip()
+        content = (page.content() or "")
     except Exception:
         return None
     m = re.search(cfg.DIA_REGEX, content, re.IGNORECASE | re.DOTALL)
     return m.group(0) if m else None
 
 def page_has_no_citas_visible(page) -> bool:
-    """True si detecta mensaje 'no hay' en texto visible del documento o sus iframes."""
+    """
+    Devuelve True si encuentra algún texto de NO_CITAS_PATTERNS que esté visible,
+    ya sea en la página principal o en iframes.
+    """
     try:
-        txt = visible_text(page)
         for pat in NO_CITAS_PATTERNS:
-            if re.search(pat, txt, flags=re.IGNORECASE):
-                return True
+            loc = page.locator(f"text=/{re.escape(pat)}/i")
+            # Si hay múltiples coincidencias, basta con que UNA sea visible
+            n = loc.count()
+            for i in range(min(n, 10)):
+                try:
+                    if loc.nth(i).is_visible():
+                        return True
+                except Exception:
+                    continue
         for fr in page.frames:
             if fr == page.main_frame:
                 continue
-            t = visible_text(fr)
             for pat in NO_CITAS_PATTERNS:
-                if re.search(pat, t, flags=re.IGNORECASE):
-                    return True
+                try:
+                    loc = fr.locator(f"text=/{re.escape(pat)}/i")
+                    n = loc.count()
+                    for i in range(min(n, 10)):
+                        try:
+                            if loc.nth(i).is_visible():
+                                return True
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
     except Exception:
         pass
     return False
 
-def wait_calendar_ready(page, timeout_ms: int = 12000) -> str:
+def find_time_nodes_anywhere(page) -> List[str]:
     """
-    Espera hasta ver horas (HH:MM) o 'no hay' en TEXTO VISIBLE (página o iframes).
+    Devuelve HH:MM visibles en cualquier nodo de la página o sus iframes.
+    Usa selectores de texto → más robusto ante cambios de layout.
+    """
+    horas = set()
+
+    # Documento principal
+    try:
+        times = page.locator(r"text=/\b([01]?\d|2[0-3]):[0-5]\d\b/")
+        n = times.count()
+        for i in range(min(n, 500)):
+            try:
+                if not times.nth(i).is_visible():
+                    continue
+                txt = (times.nth(i).inner_text() or "").strip()
+                m = TIME_RE.search(txt)
+                if m:
+                    horas.add(m.group(0))
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Iframes
+    try:
+        for fr in page.frames:
+            if fr == page.main_frame:
+                continue
+            try:
+                times = fr.locator(r"text=/\b([01]?\d|2[0-3]):[0-5]\d\b/")
+                n = times.count()
+                for i in range(min(n, 500)):
+                    try:
+                        if not times.nth(i).is_visible():
+                            continue
+                        txt = (times.nth(i).inner_text() or "").strip()
+                        m = TIME_RE.search(txt)
+                        if m:
+                            horas.add(m.group(0))
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return sorted(horas)
+
+def wait_calendar_ready(page, timeout_ms: int = 20000) -> str:
+    """
+    Espera hasta ver HH:MM visibles (página o iframes).
+    Si no aparecen horas, intenta reconocer un mensaje “no hay” visible.
     Devuelve: 'hours', 'no_citas' o 'timeout'.
     """
     deadline = time.time() + (timeout_ms / 1000.0)
-    hueco_pat = re.compile(r"Hueco\\s+libre|Huecos?\\s+libres?", re.IGNORECASE)
     while time.time() < deadline:
-        try:
-            # Principal
-            t = visible_text(page)
-            if TIME_RE.search(t) or hueco_pat.search(t):
-                return "hours"
-            if page_has_no_citas_visible(page):
-                return "no_citas"
-            # Iframes (ya los revisa page_has_no_citas_visible, pero aquí añadimos HH:MM)
-            for fr in page.frames:
-                if fr == page.main_frame:
-                    continue
-                tf = visible_text(fr)
-                if TIME_RE.search(tf) or hueco_pat.search(tf):
-                    return "hours"
-        except Exception:
-            pass
+        if find_time_nodes_anywhere(page):
+            return "hours"
+        if page_has_no_citas_visible(page):
+            return "no_citas"
         time.sleep(0.25)
     return "timeout"
-
-def extract_real_slots(page) -> List[Tuple[str, str]]:
-    """
-    Lista (hora, texto). Tolerante:
-    - Busca HH:MM en texto visible / aria-label / title.
-    - Si no encuentra botones, barre el DOM y deduce horas únicas.
-    """
-    slots: List[Tuple[str, str]] = []
-
-    selectors = [
-        cfg.BUTTON_CANDIDATES,
-        "[class*='hour'], [class*='time'], [id*='hour'], [id*='time']",
-        "[aria-label], [title]",
-        "text=/Hueco/i"
-    ]
-    try:
-        candidates = page.locator(", ".join(selectors))
-        count = candidates.count()
-    except Exception:
-        count = 0
-
-    for i in range(min(count, 800)):
-        try:
-            el = candidates.nth(i)
-            if not el.is_visible():
-                continue
-            text  = (el.inner_text() or "").strip()
-            aria  = (el.get_attribute("aria-label") or "").strip()
-            title = (el.get_attribute("title") or "").strip()
-            raw = " ".join([text, aria, title])
-            m = TIME_RE.search(raw)
-            if not m:
-                # mira el padre / abuelo por si la hora está arriba en el contenedor
-                par = el.evaluate("el => el.parentElement ? el.parentElement.innerText : ''") or ""
-                m = TIME_RE.search(par) or TIME_RE.search(
-                    el.evaluate("el => el.parentElement && el.parentElement.parentElement ? el.parentElement.parentElement.innerText : ''") or ""
-                )
-                if m:
-                    raw = raw + " " + par
-            if m:
-                hora = m.group(0)
-                label = (text or aria or title or raw or hora).strip()
-                slots.append((hora, label))
-        except Exception:
-            continue
-
-    if not slots:
-        try:
-            # Visibles primero
-            txt = visible_text(page)
-            horas = set(re.findall(r"\b([01]?\d|2[0-3]):[0-5]\d\b", txt))
-            # Como último recurso, HTML (por si el texto visible justo no contiene la primera hora)
-            if not horas:
-                html = (page.content() or "")
-                horas = set(re.findall(r"\b([01]?\d|2[0-3]):[0-5]\d\b", html))
-            for h in sorted(horas):
-                slots.append((h, f"Hora {h}"))
-        except Exception:
-            pass
-
-    # Dedup por hora
-    seen = {}
-    for h, t in slots:
-        if h not in seen:
-            seen[h] = t
-    return sorted((h, seen[h]) for h in seen.keys())
 
 # ─────────────────────────────────────────────────────────────
 # Helpers ENV
@@ -244,7 +233,7 @@ def parse_consul_list(env_val: str) -> List[Tuple[str, str, str]]:
 def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: bool = True
                          ) -> Tuple[bool, List[Tuple[str, str]], Optional[str], Optional[str]]:
     """
-    Retorna: (hay_huecos, slots, fecha_visible, screenshot_path)
+    Retorna: (hay_huecos, slots[(hora,texto)], fecha_visible, screenshot_path)
     """
     shot_path = None
     with sync_playwright() as p:
@@ -277,6 +266,7 @@ def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: b
         human_pause()
 
         if modo == "default":
+            # Botón "Continuar"
             try:
                 page.wait_for_selector(cfg.SELECTOR_CONTINUE, timeout=8000)
                 page.click(cfg.SELECTOR_CONTINUE, force=True)
@@ -284,19 +274,41 @@ def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: b
             except PTimeout:
                 pass
         elif modo == "cdmx_panel":
+            # CDMX: click al cuadro grande del aviso
             try:
                 panel = page.locator("text=/PRESENTACION|LEY MEMORIA|CONTINUAR SUPONE/i, .panel, .well, .panel-body, .card")
                 if panel.count() > 0:
                     panel.first.click(force=True)
                     human_pause()
-                    if not TIME_RE.search(visible_text(page)):
+                    # Reintento si aún no aparece nada
+                    if not find_time_nodes_anywhere(page):
                         panel.first.click(force=True)
                         human_pause()
             except Exception:
                 pass
 
-        # Esperar a ver algo concluyente usando TEXTO VISIBLE
-        status = wait_calendar_ready(page, timeout_ms=15000)
+        # Espera a ver horas O un mensaje real de "no hay"
+        status = wait_calendar_ready(page, timeout_ms=20000)
+
+        if status == "hours":
+            horas = find_time_nodes_anywhere(page)
+            slots = [(h, f"Hora {h}") for h in horas]
+            fecha = find_date_text(page)
+            if cfg.DEBUG_SHOT:
+                try:
+                    page.screenshot(path=f"/tmp/debug_{name.replace(' ', '_').lower()}_hours.jpg",
+                                    type="jpeg", quality=70, full_page=True)
+                except Exception:
+                    pass
+            if slots:
+                shot_path = f"/tmp/{name.replace(' ', '_').lower()}_citas.jpg"
+                try:
+                    page.screenshot(path=shot_path, type="jpeg", quality=70, full_page=True)
+                except Exception:
+                    shot_path = None
+            browser.close()
+            return (True, slots, fecha, shot_path)
+
         if status == "no_citas":
             if cfg.DEBUG_SHOT:
                 try:
@@ -308,47 +320,30 @@ def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: b
             browser.close()
             return (False, [], fecha, None)
 
-        # Buscar huecos (página e iframes)
-        slots = extract_real_slots(page)
+        # status == "timeout": último intento con extractor tolerante
+        # (por si la página tardó más en pintar)
+        horas = find_time_nodes_anywhere(page)
+        slots = [(h, f"Hora {h}") for h in horas]
         fecha = find_date_text(page)
-
         if not slots:
-            for fr in page.frames:
-                if fr == page.main_frame:
-                    continue
+            # Sin horas explícitas → captura ligera
+            if cfg.DEBUG_SHOT:
                 try:
-                    slots = extract_real_slots(fr)
-                    if not fecha:
-                        fecha = find_date_text(fr)
-                    if slots:
-                        break
+                    page.screenshot(path=f"/tmp/{name.replace(' ', '_').lower()}_timeout_sin_horas.jpg",
+                                    type="jpeg", quality=60, full_page=True)
                 except Exception:
-                    continue
-
-        # Captura debug si está activada
-        if cfg.DEBUG_SHOT:
-            try:
-                page.screenshot(path=f"/tmp/debug_{name.replace(' ', '_').lower()}.jpg",
-                                type="jpeg", quality=70, full_page=True)
-            except Exception:
-                pass
-
-        if slots:
-            shot_path = f"/tmp/{name.replace(' ', '_').lower()}_citas.jpg"
-            try:
-                page.screenshot(path=shot_path, type="jpeg", quality=70, full_page=True)
-            except Exception:
-                shot_path = None
+                    pass
             browser.close()
-            return (True, slots, fecha, shot_path)
+            return (False, [], fecha, None)
 
+        # Encontramos horas en timeout tardío
+        shot_path = f"/tmp/{name.replace(' ', '_').lower()}_citas.jpg"
         try:
-            page.screenshot(path=f"/tmp/{name.replace(' ', '_').lower()}_sin_huecos.jpg",
-                            type="jpeg", quality=60, full_page=True)
+            page.screenshot(path=shot_path, type="jpeg", quality=70, full_page=True)
         except Exception:
-            pass
+            shot_path = None
         browser.close()
-        return (False, [], fecha, None)
+        return (True, slots, fecha, shot_path)
 
 # ─────────────────────────────────────────────────────────────
 # Anti-spam (misma disponibilidad → no repetir)
@@ -359,7 +354,6 @@ def slots_signature(slots: List[Tuple[str, str]]) -> str:
 
 # ─────────────────────────────────────────────────────────────
 def main():
-    # Mensaje de prueba
     if os.getenv("FORCE_TEST") == "1":
         notify("🚀 Test OK: bot listo para enviar alertas.")
         print("[TEST] Notificación de prueba enviada.")
@@ -374,7 +368,7 @@ def main():
         print("[ERROR] CONSUL_URLS vacío o mal formateado.", flush=True)
         sys.exit(1)
 
-    last_sig: Dict[str, str] = {}  # nombre -> firma última disponibilidad
+    last_sig: Dict[str, str] = {}
 
     while True:
         try:
@@ -393,7 +387,7 @@ def main():
                     notify(caption)
                     if shot and os.path.exists(shot):
                         send_photo(shot, caption)
-                    time.sleep(60)  # breve antispam tras encontrar huecos
+                    time.sleep(60)  # antispam tras encontrar huecos
                 else:
                     marca = time.strftime("%Y-%m-%d %H:%M:%S")
                     print(f"[{marca}] {name} → Sin huecos reales por ahora.", flush=True)
