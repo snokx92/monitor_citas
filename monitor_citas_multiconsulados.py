@@ -23,22 +23,17 @@ class Config:
 
     # Selectores / textos comunes
     SELECTOR_CONTINUE: str = 'button.btn.btn-success, button:has-text("Continue"), button:has-text("Continuar")'
-    TEXT_NO_CITAS: str     = "No hay horas disponibles"  # se usa como pista, pero ahora tenemos patrones más amplios
     BUTTON_CANDIDATES: str = "button, .btn, [role=button], a"
     DIA_REGEX: str         = r"(Lunes|Martes|Miércoles|Jueves|Viernes|Sábado|Domingo).*?\b\d{4}\b"
 
     # Lista de consulados por ENV
-    # Formatos por elemento:
     #   Nombre|URL                → modo "default"
     #   Nombre|URL|cdmx_panel     → modo CDMX (click al cuadro)
     CONSUL_URLS: str = os.getenv(
         "CONSUL_URLS",
         ",".join([
-            # Monterrey (default)
             "Monterrey|https://www.citaconsular.es/es/hosteds/widgetdefault/25b18886db70f7ec9fd6dfd1a85d1395f/|default",
-            # Ciudad de México (panel)
             "Ciudad de México|https://www.citaconsular.es/es/hosteds/widgetdefault/21b7c1aaf9fef2785deb64ccab5ceca06/|cdmx_panel",
-            # Miami (default)
             "Miami|https://www.citaconsular.es/es/hosteds/widgetdefault/2533f04b1d3e818b66f175afc9c24cf63/|default",
         ])
     )
@@ -80,15 +75,12 @@ def send_photo(path: str, caption: str = ""):
 # Anti-detección
 # ─────────────────────────────────────────────────────────────
 USER_AGENTS = [
-    # Windows
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
-    # macOS
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4; rv:127.0) Gecko/20100101 Firefox/127.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    # Móviles
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
     "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
 ]
@@ -100,13 +92,19 @@ def human_pause():
 # ─────────────────────────────────────────────────────────────
 TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
 
-# Mensajes inequívocos de “no hay” (insensible a mayúsculas/acentos)
+# Mensajes inequívocos de “no hay” (se evalúan sobre TEXTO VISIBLE, no HTML)
 NO_CITAS_PATTERNS = [
     r"No hay horas disponibles",
     r"No hay citas disponibles",
     r"No hay disponibilidad",
     r"Inténtelo de nuevo dentro de unos días",
 ]
+
+def visible_text(page) -> str:
+    try:
+        return (page.inner_text("body") or "")
+    except Exception:
+        return ""
 
 def find_date_text(page) -> Optional[str]:
     try:
@@ -116,43 +114,46 @@ def find_date_text(page) -> Optional[str]:
     m = re.search(cfg.DIA_REGEX, content, re.IGNORECASE | re.DOTALL)
     return m.group(0) if m else None
 
-def page_has_no_citas(page) -> bool:
-    """True si detecta algún mensaje inequívoco de 'no hay citas' en la página."""
+def page_has_no_citas_visible(page) -> bool:
+    """True si detecta mensaje 'no hay' en texto visible del documento o sus iframes."""
     try:
-        html = (page.content() or "")
+        txt = visible_text(page)
         for pat in NO_CITAS_PATTERNS:
-            if re.search(pat, html, flags=re.IGNORECASE):
+            if re.search(pat, txt, flags=re.IGNORECASE):
                 return True
+        for fr in page.frames:
+            if fr == page.main_frame:
+                continue
+            t = visible_text(fr)
+            for pat in NO_CITAS_PATTERNS:
+                if re.search(pat, t, flags=re.IGNORECASE):
+                    return True
     except Exception:
         pass
     return False
 
-def wait_calendar_ready(page, timeout_ms: int = 8000) -> str:
+def wait_calendar_ready(page, timeout_ms: int = 12000) -> str:
     """
-    Espera hasta que vea horas (HH:MM) o un mensaje 'no hay citas'.
-    Revisa también iframes. Devuelve: 'hours', 'no_citas' o 'timeout'.
+    Espera hasta ver horas (HH:MM) o 'no hay' en TEXTO VISIBLE (página o iframes).
+    Devuelve: 'hours', 'no_citas' o 'timeout'.
     """
     deadline = time.time() + (timeout_ms / 1000.0)
+    hueco_pat = re.compile(r"Hueco\\s+libre|Huecos?\\s+libres?", re.IGNORECASE)
     while time.time() < deadline:
         try:
-            # Documento principal
-            body = (page.inner_text("body") or "")
-            if TIME_RE.search(body):
+            # Principal
+            t = visible_text(page)
+            if TIME_RE.search(t) or hueco_pat.search(t):
                 return "hours"
-            if page_has_no_citas(page):
+            if page_has_no_citas_visible(page):
                 return "no_citas"
-            # Iframes
+            # Iframes (ya los revisa page_has_no_citas_visible, pero aquí añadimos HH:MM)
             for fr in page.frames:
                 if fr == page.main_frame:
                     continue
-                try:
-                    fbody = (fr.inner_text("body") or "")
-                    if TIME_RE.search(fbody):
-                        return "hours"
-                    if page_has_no_citas(fr):
-                        return "no_citas"
-                except Exception:
-                    continue
+                tf = visible_text(fr)
+                if TIME_RE.search(tf) or hueco_pat.search(tf):
+                    return "hours"
         except Exception:
             pass
         time.sleep(0.25)
@@ -160,8 +161,8 @@ def wait_calendar_ready(page, timeout_ms: int = 8000) -> str:
 
 def extract_real_slots(page) -> List[Tuple[str, str]]:
     """
-    Devuelve lista (hora, texto_boton). Tolerante:
-    - Busca hora en texto, aria-label o title.
+    Lista (hora, texto). Tolerante:
+    - Busca HH:MM en texto visible / aria-label / title.
     - Si no encuentra botones, barre el DOM y deduce horas únicas.
     """
     slots: List[Tuple[str, str]] = []
@@ -170,6 +171,7 @@ def extract_real_slots(page) -> List[Tuple[str, str]]:
         cfg.BUTTON_CANDIDATES,
         "[class*='hour'], [class*='time'], [id*='hour'], [id*='time']",
         "[aria-label], [title]",
+        "text=/Hueco/i"
     ]
     try:
         candidates = page.locator(", ".join(selectors))
@@ -177,7 +179,7 @@ def extract_real_slots(page) -> List[Tuple[str, str]]:
     except Exception:
         count = 0
 
-    for i in range(min(count, 600)):
+    for i in range(min(count, 800)):
         try:
             el = candidates.nth(i)
             if not el.is_visible():
@@ -187,37 +189,46 @@ def extract_real_slots(page) -> List[Tuple[str, str]]:
             title = (el.get_attribute("title") or "").strip()
             raw = " ".join([text, aria, title])
             m = TIME_RE.search(raw)
+            if not m:
+                # mira el padre / abuelo por si la hora está arriba en el contenedor
+                par = el.evaluate("el => el.parentElement ? el.parentElement.innerText : ''") or ""
+                m = TIME_RE.search(par) or TIME_RE.search(
+                    el.evaluate("el => el.parentElement && el.parentElement.parentElement ? el.parentElement.parentElement.innerText : ''") or ""
+                )
+                if m:
+                    raw = raw + " " + par
             if m:
                 hora = m.group(0)
-                label = text or aria or title or hora
+                label = (text or aria or title or raw or hora).strip()
                 slots.append((hora, label))
         except Exception:
             continue
 
     if not slots:
         try:
-            html = (page.content() or "")
-            horas = sorted(set(re.findall(r"\b([01]?\d|2[0-3]):[0-5]\d\b", html)))
-            for h in horas:
+            # Visibles primero
+            txt = visible_text(page)
+            horas = set(re.findall(r"\b([01]?\d|2[0-3]):[0-5]\d\b", txt))
+            # Como último recurso, HTML (por si el texto visible justo no contiene la primera hora)
+            if not horas:
+                html = (page.content() or "")
+                horas = set(re.findall(r"\b([01]?\d|2[0-3]):[0-5]\d\b", html))
+            for h in sorted(horas):
                 slots.append((h, f"Hora {h}"))
         except Exception:
             pass
 
-    # Deduplicar por hora
+    # Dedup por hora
     seen = {}
     for h, t in slots:
         if h not in seen:
             seen[h] = t
-    return sorted([(h, seen[h]) for h in seen.keys()])
+    return sorted((h, seen[h]) for h in seen.keys())
 
 # ─────────────────────────────────────────────────────────────
 # Helpers ENV
 # ─────────────────────────────────────────────────────────────
 def parse_consul_list(env_val: str) -> List[Tuple[str, str, str]]:
-    """
-    Devuelve lista (nombre, url, modo). Modo por defecto: 'default'.
-    Separa consulados por coma, campos por '|'.
-    """
     out: List[Tuple[str, str, str]] = []
     for item in [s.strip() for s in env_val.split(",") if s.strip()]:
         parts = [p.strip() for p in item.split("|")]
@@ -266,7 +277,6 @@ def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: b
         human_pause()
 
         if modo == "default":
-            # Botón "Continuar"
             try:
                 page.wait_for_selector(cfg.SELECTOR_CONTINUE, timeout=8000)
                 page.click(cfg.SELECTOR_CONTINUE, force=True)
@@ -274,21 +284,19 @@ def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: b
             except PTimeout:
                 pass
         elif modo == "cdmx_panel":
-            # CDMX: click al cuadro grande del aviso
             try:
                 panel = page.locator("text=/PRESENTACION|LEY MEMORIA|CONTINUAR SUPONE/i, .panel, .well, .panel-body, .card")
                 if panel.count() > 0:
                     panel.first.click(force=True)
                     human_pause()
-                    # Reintento si aún no aparece nada
-                    if not page.locator("text=/\\b([01]?\\d|2[0-3]):[0-5]\\d\\b/").count():
+                    if not TIME_RE.search(visible_text(page)):
                         panel.first.click(force=True)
                         human_pause()
             except Exception:
                 pass
 
-        # Espera a que se vea algo concluyente: horas o mensaje "no hay"
-        status = wait_calendar_ready(page, timeout_ms=8000)
+        # Esperar a ver algo concluyente usando TEXTO VISIBLE
+        status = wait_calendar_ready(page, timeout_ms=15000)
         if status == "no_citas":
             if cfg.DEBUG_SHOT:
                 try:
@@ -299,13 +307,11 @@ def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: b
             fecha = find_date_text(page)
             browser.close()
             return (False, [], fecha, None)
-        # 'hours' → seguimos; 'timeout' → igual probamos extractor (por si tarda más)
 
-        # Buscar huecos
+        # Buscar huecos (página e iframes)
         slots = extract_real_slots(page)
         fecha = find_date_text(page)
 
-        # Probar iframes si aún no hay
         if not slots:
             for fr in page.frames:
                 if fr == page.main_frame:
@@ -336,7 +342,6 @@ def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: b
             browser.close()
             return (True, slots, fecha, shot_path)
 
-        # Sin huecos: captura liviana opcional
         try:
             page.screenshot(path=f"/tmp/{name.replace(' ', '_').lower()}_sin_huecos.jpg",
                             type="jpeg", quality=60, full_page=True)
