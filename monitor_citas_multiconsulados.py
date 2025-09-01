@@ -37,8 +37,11 @@ class Config:
         ])
     )
 
-    # Capturas de depuración (1 = activadas)
+    # Capturas de depuración (1 = guarda .jpg en /tmp/)
     DEBUG_SHOT: bool = os.getenv("DEBUG_SHOT", "0") == "1"
+
+    # Enviar SIEMPRE las capturas por Telegram (haya o no huecos)
+    SEND_ALL_SHOTS: bool = os.getenv("SEND_ALL_SHOTS", "0") == "1"
 
 cfg = Config()
 
@@ -93,7 +96,7 @@ def human_pause():
 # ─────────────────────────────────────────────────────────────
 TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
 
-# Mensajes “no hay” (se validan solo si el elemento es VISIBLE)
+# Mensajes “no hay” (solo si el elemento es VISIBLE)
 NO_CITAS_PATTERNS = [
     "No hay horas disponibles",
     "No hay citas disponibles",
@@ -117,13 +120,11 @@ def find_date_text(page) -> Optional[str]:
 
 def page_has_no_citas_visible(page) -> bool:
     """
-    Devuelve True si encuentra algún texto de NO_CITAS_PATTERNS que esté visible,
-    ya sea en la página principal o en iframes.
+    True si encuentra texto de NO_CITAS_PATTERNS visible en página o iframes.
     """
     try:
         for pat in NO_CITAS_PATTERNS:
             loc = page.locator(f"text=/{re.escape(pat)}/i")
-            # Si hay múltiples coincidencias, basta con que UNA sea visible
             n = loc.count()
             for i in range(min(n, 10)):
                 try:
@@ -153,19 +154,18 @@ def page_has_no_citas_visible(page) -> bool:
 def find_time_nodes_anywhere(page) -> List[str]:
     """
     Devuelve HH:MM visibles en cualquier nodo de la página o sus iframes.
-    Usa selectores de texto → más robusto ante cambios de layout.
     """
     horas = set()
 
-    # Documento principal
     try:
         times = page.locator(r"text=/\b([01]?\d|2[0-3]):[0-5]\d\b/")
         n = times.count()
         for i in range(min(n, 500)):
             try:
-                if not times.nth(i).is_visible():
+                node = times.nth(i)
+                if not node.is_visible():
                     continue
-                txt = (times.nth(i).inner_text() or "").strip()
+                txt = (node.inner_text() or "").strip()
                 m = TIME_RE.search(txt)
                 if m:
                     horas.add(m.group(0))
@@ -174,26 +174,23 @@ def find_time_nodes_anywhere(page) -> List[str]:
     except Exception:
         pass
 
-    # Iframes
     try:
         for fr in page.frames:
             if fr == page.main_frame:
                 continue
-            try:
-                times = fr.locator(r"text=/\b([01]?\d|2[0-3]):[0-5]\d\b/")
-                n = times.count()
-                for i in range(min(n, 500)):
-                    try:
-                        if not times.nth(i).is_visible():
-                            continue
-                        txt = (times.nth(i).inner_text() or "").strip()
-                        m = TIME_RE.search(txt)
-                        if m:
-                            horas.add(m.group(0))
-                    except Exception:
+            times = fr.locator(r"text=/\b([01]?\d|2[0-3]):[0-5]\d\b/")
+            n = times.count()
+            for i in range(min(n, 500)):
+                try:
+                    node = times.nth(i)
+                    if not node.is_visible():
                         continue
-            except Exception:
-                continue
+                    txt = (node.inner_text() or "").strip()
+                    m = TIME_RE.search(txt)
+                    if m:
+                        horas.add(m.group(0))
+                except Exception:
+                    continue
     except Exception:
         pass
 
@@ -202,7 +199,7 @@ def find_time_nodes_anywhere(page) -> List[str]:
 def wait_calendar_ready(page, timeout_ms: int = 20000) -> str:
     """
     Espera hasta ver HH:MM visibles (página o iframes).
-    Si no aparecen horas, intenta reconocer un mensaje “no hay” visible.
+    Si no aparecen, intenta reconocer “no hay” visible.
     Devuelve: 'hours', 'no_citas' o 'timeout'.
     """
     deadline = time.time() + (timeout_ms / 1000.0)
@@ -251,7 +248,7 @@ def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: b
             extra_http_headers={"Accept-Language": "es-MX,es;q=0.9,en;q=0.8"},
         )
 
-        # Aceptar popups "Welcome / Bienvenido"
+        # Aceptar "Welcome / Bienvenido"
         def on_dialog(dialog):
             try:
                 dialog.accept()
@@ -266,7 +263,6 @@ def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: b
         human_pause()
 
         if modo == "default":
-            # Botón "Continuar"
             try:
                 page.wait_for_selector(cfg.SELECTOR_CONTINUE, timeout=8000)
                 page.click(cfg.SELECTOR_CONTINUE, force=True)
@@ -274,76 +270,76 @@ def revisar_un_consulado(name: str, url: str, modo: str = "default", headless: b
             except PTimeout:
                 pass
         elif modo == "cdmx_panel":
-            # CDMX: click al cuadro grande del aviso
             try:
-                panel = page.locator("text=/PRESENTACION|LEY MEMORIA|CONTINUAR SUPONE/i, .panel, .well, .panel-body, .card")
+                panel = page.locator(
+                    "text=/PRESENTACION|LEY MEMORIA|CONTINUAR SUPONE/i, .panel, .well, .panel-body, .card"
+                )
                 if panel.count() > 0:
                     panel.first.click(force=True)
                     human_pause()
-                    # Reintento si aún no aparece nada
                     if not find_time_nodes_anywhere(page):
                         panel.first.click(force=True)
                         human_pause()
             except Exception:
                 pass
 
-        # Espera a ver horas O un mensaje real de "no hay"
+        # Espera a ver horas O un “no hay” visible
         status = wait_calendar_ready(page, timeout_ms=20000)
 
         if status == "hours":
             horas = find_time_nodes_anywhere(page)
             slots = [(h, f"Hora {h}") for h in horas]
             fecha = find_date_text(page)
+
+            # Capturas
             if cfg.DEBUG_SHOT:
                 try:
                     page.screenshot(path=f"/tmp/debug_{name.replace(' ', '_').lower()}_hours.jpg",
                                     type="jpeg", quality=70, full_page=True)
                 except Exception:
                     pass
-            if slots:
-                shot_path = f"/tmp/{name.replace(' ', '_').lower()}_citas.jpg"
-                try:
-                    page.screenshot(path=shot_path, type="jpeg", quality=70, full_page=True)
-                except Exception:
-                    shot_path = None
+            shot_path = f"/tmp/{name.replace(' ', '_').lower()}_citas.jpg"
+            try:
+                page.screenshot(path=shot_path, type="jpeg", quality=70, full_page=True)
+            except Exception:
+                shot_path = None
+
+            # Enviar foto siempre si está habilitado, o solo cuando hay huecos (si no)
+            if shot_path and os.path.exists(shot_path) and (cfg.SEND_ALL_SHOTS or slots):
+                caption = f"📸 Vista de {name} (horas detectadas: {', '.join(horas)})"
+                send_photo(shot_path, caption)
+
             browser.close()
             return (True, slots, fecha, shot_path)
 
         if status == "no_citas":
-            if cfg.DEBUG_SHOT:
-                try:
-                    page.screenshot(path=f"/tmp/{name.replace(' ', '_').lower()}_no_citas.jpg",
-                                    type="jpeg", quality=70, full_page=True)
-                except Exception:
-                    pass
             fecha = find_date_text(page)
+            # Captura y envío si aplica
+            no_shot = f"/tmp/{name.replace(' ', '_').lower()}_no_citas.jpg"
+            try:
+                page.screenshot(path=no_shot, type="jpeg", quality=70, full_page=True)
+            except Exception:
+                no_shot = None
+            if cfg.SEND_ALL_SHOTS and no_shot and os.path.exists(no_shot):
+                send_photo(no_shot, f"📸 {name}: sin huecos (señal visible de 'no hay').")
             browser.close()
             return (False, [], fecha, None)
 
-        # status == "timeout": último intento con extractor tolerante
-        # (por si la página tardó más en pintar)
+        # status == "timeout"
+        fecha = find_date_text(page)
         horas = find_time_nodes_anywhere(page)
         slots = [(h, f"Hora {h}") for h in horas]
-        fecha = find_date_text(page)
-        if not slots:
-            # Sin horas explícitas → captura ligera
-            if cfg.DEBUG_SHOT:
-                try:
-                    page.screenshot(path=f"/tmp/{name.replace(' ', '_').lower()}_timeout_sin_horas.jpg",
-                                    type="jpeg", quality=60, full_page=True)
-                except Exception:
-                    pass
-            browser.close()
-            return (False, [], fecha, None)
 
-        # Encontramos horas en timeout tardío
-        shot_path = f"/tmp/{name.replace(' ', '_').lower()}_citas.jpg"
+        timeout_shot = f"/tmp/{name.replace(' ', '_').lower()}_timeout.jpg"
         try:
-            page.screenshot(path=shot_path, type="jpeg", quality=70, full_page=True)
+            page.screenshot(path=timeout_shot, type="jpeg", quality=60, full_page=True)
         except Exception:
-            shot_path = None
+            timeout_shot = None
+        if cfg.SEND_ALL_SHOTS and timeout_shot and os.path.exists(timeout_shot):
+            send_photo(timeout_shot, f"⏳ {name}: timeout. Horas detectadas: {', '.join(horas) or 'ninguna'}")
+
         browser.close()
-        return (True, slots, fecha, shot_path)
+        return (bool(slots), slots, fecha, None)
 
 # ─────────────────────────────────────────────────────────────
 # Anti-spam (misma disponibilidad → no repetir)
@@ -385,8 +381,11 @@ def main():
                     suf_fecha = f" ({fecha})" if fecha else ""
                     caption = f"✅ ¡HAY HUECOS en {name}!{suf_fecha}\nHoras: {primeras}\nEntra ya: {url}"
                     notify(caption)
+
+                    # Enviar la captura de “citas” si existe
                     if shot and os.path.exists(shot):
                         send_photo(shot, caption)
+
                     time.sleep(60)  # antispam tras encontrar huecos
                 else:
                     marca = time.strftime("%Y-%m-%d %H:%M:%S")
