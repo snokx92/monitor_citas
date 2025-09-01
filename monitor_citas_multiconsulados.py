@@ -511,16 +511,20 @@ def main():
             time.sleep(120)
 
 # ─────────────────────────────────────────────────────────────
-if _name_ == "_main_":
+if __name__ == "__main__":
     headed = len(sys.argv) > 1 and sys.argv[1].lower().startswith("head")
     if headed:
         print("Headed demo de CDMX...")
+        from typing import Optional
+        def _choose():
+            from random import random
+            return None
         print(revisar_un_consulado(
             "Ciudad de México",
             "https://www.citaconsular.es/es/hosteds/widgetdefault/21b7c1aaf9fef2785deb64ccab5ceca06/",
             "cdmx_panel",
             headless=False,
-            proxy_conf=choose_proxy(parse_proxies(cfg.PROXY_LIST)) if cfg.PROXY_LIST else None
+            proxy_conf=None
         ))
     else:
         main()
