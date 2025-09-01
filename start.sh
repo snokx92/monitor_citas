@@ -1,14 +1,12 @@
 #!/bin/bash
 set -e
 
-# Instalar Chromium + dependencias del sistema para Linux
-# (usa --with-deps; si tu versión de Playwright no lo soporta, ver fallback abajo)
-python -m playwright install --with-deps chromium || \
-(
-  # Fallback para versiones que no soportan --with-deps
-  python -m playwright install-deps chromium
+# Instalar Chromium y dependencias de sistema para Playwright
+python -m playwright install --with-deps chromium || (
+  # fallback si el flag --with-deps falla en el entorno
+  python -m playwright install-deps chromium || true
   python -m playwright install chromium
 )
 
-# Arrancar el bot
-python monitor_citas_huecos.py
+# Ejecuta el bot
+python monitor_citas_multiconsulados.py
