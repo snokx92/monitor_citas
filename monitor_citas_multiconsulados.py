@@ -1,406 +1,357 @@
-# -*- coding: utf-8 -*-
-"""
-Monitor de citas Bookitit para Mty/CDMX con evidencias a Telegram
-- Flujo CDMX: Bienvenida → Continuar → Panel "PRESENTACION..." → calendario
-- Flujo Mty: Bienvenida → Continuar → calendario
-- Evidencias: HTML y screenshot en cada paso clave
-- Detección de huecos: botones con 'Hueco libre' y una HORA (HH:MM)
-- Proxy residencial (DataImpulse) opcional
-"""
-
-import os, re, sys, io, time, random, json
-from dataclasses import dataclass
-from typing import Optional, Tuple, List, Dict
+import os, sys, time, random, traceback, textwrap
+from datetime import datetime
+from pathlib import Path
 import requests
 
-from playwright.sync_api import sync_playwright, TimeoutError as PTimeout, Page, BrowserContext
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# ======================
-# CONFIG & ENV
-# ======================
+# ========= util/env =========
+def env_flag(name, default="0"):
+    return os.getenv(name, default).strip().lower() in ("1","true","yes","on")
 
-TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")  # 0:00–23:59
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID","").strip()
 
-@dataclass
-class Consulado:
-    nombre: str
-    # Página ministerio (donde está el enlace “ELEGIR FECHA Y HORA”)
-    ministerio_url: str
-    # Texto del panel (solo CDMX necesita este paso intermedio)
-    panel_texto: Optional[str] = None
+PROXY_HOST  = os.getenv("PROXY_HOST","").strip()
+PROXY_PORT  = os.getenv("PROXY_PORT","").strip()
+PROXY_USER  = os.getenv("PROXY_USER","").strip()
+PROXY_PASS  = os.getenv("PROXY_PASS","").strip()
+PROXY_SESSION_IN_USER = env_flag("PROXY_SESSION_IN_USER","0")
 
-@dataclass
-class Cfg:
-    # ====== Consulados a monitorear ======
-    CONSULADOS: List[Consulado] = (
-        # Monterrey
-        Consulado(
-            nombre="Monterrey",
-            ministerio_url="https://www.exteriores.gob.es/Consulados/monterrey/es/ServiciosConsulares/Paginas/CitaNacionalidadLMD.aspx",
-            panel_texto=None,  # Mty no requiere panel intermedio
-        ),
-        # Ciudad de México (con panel intermedio)
-        Consulado(
-            nombre="Ciudad de México",
-            ministerio_url="https://www.exteriores.gob.es/Consulados/mexico/es/ServiciosConsulares/Paginas/CitaNacionalidadLMD.aspx",
-            panel_texto="PRESENTACION DOCUMENTACION LEY MEMORIA DEMOCRATICA",
-        ),
-    )
+BLOCK_IMAGES       = env_flag("BLOCK_IMAGES","0")
+DEBUG_STEPS        = env_flag("DEBUG_STEPS","1")
+GOTO_RETRIES       = int(os.getenv("GOTO_RETRIES","2"))
+LANDING_TIMEOUT_MS = int(os.getenv("LANDING_TIMEOUT_MS","45000"))
+WIDGET_TIMEOUT_MS  = int(os.getenv("WIDGET_TIMEOUT_MS","50000"))
+PAGE_OP_TIMEOUT_MS = int(os.getenv("PAGE_OP_TIMEOUT_MS","8000"))
 
-    # ========= Telegram =========
-    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+ROTATE_AFTER_BLANK = env_flag("ROTATE_AFTER_BLANK","1")
+ROTATE_COOLDOWN    = int(os.getenv("ROTATE_COOLDOWN_SEC","90"))
 
-    # ========= Anti-bloqueos / humano =========
-    HUMAN_MIN: float = float(os.getenv("HUMAN_MIN", "0.8"))
-    HUMAN_MAX: float = float(os.getenv("HUMAN_MAX", "1.8"))
+SHOW_PUBLIC_IP     = env_flag("SHOW_PUBLIC_IP","1")
+IP_ENDPOINT        = os.getenv("IP_ENDPOINT","https://api.ipify.org")
 
-    # ========= Intervalos =========
-    # Entre rondas completas
-    ROUND_MIN_S: int = int(os.getenv("ROUND_MIN_S", "300"))   # 5 min
-    ROUND_MAX_S: int = int(os.getenv("ROUND_MAX_S", "420"))   # 7 min
-    # Esperas de carga
-    LANDING_TIMEOUT_MS: int = int(os.getenv("LANDING_TIMEOUT_MS", "25000"))
-    WIDGET_TIMEOUT_MS:  int = int(os.getenv("WIDGET_TIMEOUT_MS",  "25000"))
+# nuevos endurecedores
+ROUNDS_PER_RESTART      = int(os.getenv("ROUNDS_PER_RESTART","24"))  # reinicio preventivo
+LAUNCH_RETRY_MAX        = int(os.getenv("LAUNCH_RETRY_MAX","4"))
+LAUNCH_RETRY_BASE_DELAY = int(os.getenv("LAUNCH_RETRY_BASE_DELAY","5"))
 
-    # ========= Comportamiento =========
-    BLOCK_IMAGES: str = os.getenv("BLOCK_IMAGES", "ON")  # ON/OFF
-    DEBUG_STEPS: str = os.getenv("DEBUG_STEPS", "ON")    # ON/OFF (envía evidencias)
-    SHOW_PUBLIC_IP: str = os.getenv("SHOW_PUBLIC_IP", "ON")
+# pausa humanizada entre rondas
+ROUND_MIN_WAIT = 300   # 5 min
+ROUND_MAX_WAIT = 420   # 7 min
 
-    # ========= Proxy (DataImpulse) =========
-    PROXY_HOST: str = os.getenv("PROXY_HOST", "").strip()
-    PROXY_PORT: str = os.getenv("PROXY_PORT", "").strip()  # EJ: 823
-    PROXY_USER: str = os.getenv("PROXY_USER", "").strip()
-    PROXY_PASS: str = os.getenv("PROXY_PASS", "").strip()
+OUTDIR = Path("/tmp/evidencias"); OUTDIR.mkdir(parents=True, exist_ok=True)
+def now(): return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-cfg = Cfg()
-
-# ======================
-# Telegram helpers
-# ======================
-
-def t_send_message(text: str):
-    print(text, flush=True)
-    if not (cfg.TELEGRAM_BOT_TOKEN and cfg.TELEGRAM_CHAT_ID):
-        return
+# ========= telegram =========
+def tg_text(msg: str):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID): return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{cfg.TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": text},
-            timeout=15,
-        )
-    except Exception as e:
-        print(f"[WARN] Telegram message failed: {e}", file=sys.stderr, flush=True)
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                      data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+    except Exception: pass
 
-def t_send_file(caption: str, filename: str, data: bytes):
-    print(f"[proof] file -> {filename} / {caption}", flush=True)
-    if not (cfg.TELEGRAM_BOT_TOKEN and cfg.TELEGRAM_CHAT_ID):
-        return
-    url = f"https://api.telegram.org/bot{cfg.TELEGRAM_BOT_TOKEN}/sendDocument"
-    files = {"document": (filename, data)}
+def tg_file(path: Path, caption=""):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID): return
+    if not path.exists(): return
     try:
-        requests.post(url, data={"chat_id": cfg.TELEGRAM_CHAT_ID, "caption": caption}, files=files, timeout=30)
-    except Exception as e:
-        print(f"[WARN] Telegram doc failed: {e}", file=sys.stderr, flush=True)
+        with open(path,"rb") as f:
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                          data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                          files={"document":(path.name,f)})
+    except Exception: pass
 
-def send_html(name: str, page: Page, caption: str):
-    try:
-        html = (page.content() or "").encode("utf-8", "ignore")
-        t_send_file(caption, f"{name}.html", html)
-    except Exception as e:
-        print(f"[WARN] dump html failed: {e}", flush=True)
+def save_html(page, path: Path): path.write_text(page.content(), encoding="utf-8")
+def shot_jpg(page, path: Path, full=False): page.screenshot(path=str(path), type="jpeg", quality=70, full_page=full)
 
-def send_screenshot(name: str, page: Page, caption: str):
-    try:
-        png = page.screenshot(full_page=True)
-        t_send_file(caption, f"{name}.png", png)
-    except Exception as e:
-        print(f"[WARN] screenshot failed: {e}", flush=True)
+def human(a,b): time.sleep(random.uniform(a,b))
 
-def hpause(a: Optional[float]=None, b: Optional[float]=None):
-    lo = cfg.HUMAN_MIN if a is None else a
-    hi = cfg.HUMAN_MAX if b is None else b
-    time.sleep(random.uniform(lo, hi))
+# ========= proxy =========
+def build_proxy():
+    if not PROXY_HOST or not PROXY_PORT: return None
+    if PROXY_USER and PROXY_PASS:
+        user = PROXY_USER
+        if PROXY_SESSION_IN_USER:
+            user = f"{PROXY_USER}_cr.us,mx"
+        return {"server": f"http://{PROXY_HOST}:{PROXY_PORT}", "username": user, "password": PROXY_PASS}
+    return {"server": f"http://{PROXY_HOST}:{PROXY_PORT}"}
 
-# ======================
-# Navegación helpers
-# ======================
+# ========= URLs / selectores =========
+MIN_MTY  = "https://www.exteriores.gob.es/Consulados/monterrey/es/ServiciosConsulares/Paginas/CitaNacionalidadLMD.aspx"
+MIN_CDMX = "https://www.exteriores.gob.es/Consulados/mexico/es/ServiciosConsulares/Paginas/CitaNacionalidadLMD.aspx"
 
-def context_args_for_proxy() -> Dict:
-    if not cfg.PROXY_HOST or not cfg.PROXY_PORT:
-        return {}
-    proxy = {
-        "server": f"http://{cfg.PROXY_HOST}:{cfg.PROXY_PORT}"
-    }
-    if cfg.PROXY_USER and cfg.PROXY_PASS:
-        proxy["username"] = cfg.PROXY_USER
-        proxy["password"] = cfg.PROXY_PASS
-    return {"proxy": proxy}
+WIDGET_MTY  = "https://www.citaconsular.es/es/hosteds/widgetdefault/2533f04b1d3e818b66f175afc9c24cf63/"
+WIDGET_CDMX = "https://www.citaconsular.es/es/hosteds/widgetdefault/21b7c1aaf9fef2785deb64ccab5ceca06/"
 
-def safe_wait_text(page: Page, text: str, timeout: int) -> bool:
-    """
-    Espera a que aparezca un texto evitando el strict-mode error de Playwright.
-    Devuelve True si lo ve; False si no.
-    """
-    try:
-        loc = page.get_by_text(text, exact=False).nth(0)
-        loc.wait_for(state="visible", timeout=timeout)
-        return True
-    except PTimeout:
-        return False
-    except Exception as e:
-        print(f"[WARN] safe_wait_text('{text}') -> {e}", flush=True)
-        return False
+MIN_YELLOW_LINK = "text=/ELEGIR FECHA Y HORA/i"
+BTN_CONTINUE    = "text=/Continue\\s*\\/\\s*Continuar/i"
+CDMX_PANEL      = "text=/PRESENTACION DOCUMENTACION LEY MEMORIA/i"
+NO_SLOTS_TEXT   = "text=/No hay horas disponibles/i"
+CAL_CHANGE_DAY  = "text=/Cambiar de d[ií]a/i"
+SLOT_BUTTONS    = "button:has-text('Hueco'), button:has-text('Huecos'), button:has-text('libre')"
+SPINNER_LOADING = "text=/Loading|Cargando/i"
 
-def wait_widget_ready(page: Page) -> None:
-    # aquí el widget de Bookitit suele estar ya “vivo” (aparece botón Continuar)
-    safe_wait_text(page, "Continuar", timeout=cfg.WIDGET_TIMEOUT_MS)
-
-def click_continue_if_present(page: Page) -> None:
-    # botón “Continue / Continuar”
-    try:
-        btn = page.get_by_role("button", name=re.compile(r"continuar|continue", re.I)).nth(0)
-        if btn.is_visible():
-            btn.click(force=True)
-            hpause()
-    except Exception:
-        # fallback por texto
+# ========= navegación robusta =========
+def goto(page, url, timeout_ms):
+    last=None
+    for _ in range(GOTO_RETRIES+1):
         try:
-            page.get_by_text("Continuar", exact=False).nth(0).click(force=True)
-            hpause()
-        except Exception:
-            pass
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_load_state("networkidle", timeout=timeout_ms)
+            return True
+        except Exception as e:
+            last=e; human(0.6,1.3)
+    if DEBUG_STEPS: tg_text(f"[warn] GOTO falló: {url}\n{last}")
+    return False
 
-def click_panel_if_needed(page: Page, texto_panel: Optional[str]) -> None:
-    if not texto_panel:
-        return
-    # Para CDMX: click al recuadro grande que contiene ese texto
+def wait_widget_ready(page):
+    # intenta detectar bienvenida/continuar o “no hay…”
     try:
-        # Primero asegurarnos de que la caja cargó (a veces tarda)
-        safe_wait_text(page, "PRESENTACION", timeout=cfg.WIDGET_TIMEOUT_MS)
-        panel = page.get_by_text(texto_panel, exact=False).nth(0)
-        panel.click(force=True)
-        hpause()
-    except Exception as e:
-        print(f"[WARN] click_panel_if_needed: {e}", flush=True)
-
-def open_widget_from_ministerio(context: BrowserContext, cons: Consulado) -> Page:
-    """
-    Abre ministerio → click 'ELEGIR FECHA Y HORA' (abre Bookitit en nueva pestaña)
-    Devuelve la página del widget.
-    """
-    page = context.new_page()
-    page.set_default_timeout(cfg.LANDING_TIMEOUT_MS)
-    # 1) ministerio
-    page.goto(cons.ministerio_url, wait_until="domcontentloaded")
-    hpause(1.2, 2.2)
-    if cfg.DEBUG_STEPS.upper() == "ON":
-        send_screenshot(f"{cons.nombre.lower()}_ministerio", page, f"{cons.nombre}: HTML inicial (ministerio)")
-        send_html(f"{cons.nombre.lower()}_ministerio", page, f"{cons.nombre}: HTML ministerio")
-
-    # 2) click enlace “ELEGIR FECHA Y HORA”
-    # puede decir “ELEGIR FECHA Y HORA” o variaciones
-    link = None
-    try:
-        link = page.get_by_role("link", name=re.compile(r"ELEGIR\s+FECHA\s+Y\s+HORA", re.I)).nth(0)
-    except Exception:
-        pass
-    if not link:
-        # fallback por texto
-        link = page.get_by_text("ELEGIR FECHA Y HORA", exact=False).nth(0)
-
-    # Capturamos nueva pestaña
-    with page.expect_popup() as newp:
-        link.click(force=True)
-    widget = newp.value
-    widget.set_default_timeout(cfg.WIDGET_TIMEOUT_MS)
-
-    # algunas webs muestran un alert("Welcome / Bienvenido")
-    def on_dialog(dialog):
+        page.wait_for_timeout(400)
+        page.wait_for_selector(f"{BTN_CONTINUE}, {NO_SLOTS_TEXT}", timeout=WIDGET_TIMEOUT_MS)
+    except PWTimeout:
+        # aceptar modal si sale
         try:
-            dialog.accept()
-        except Exception:
-            pass
-    widget.on("dialog", on_dialog)
+            page.get_by_text("Bienvenido").or_(page.get_by_text("Welcome")).get_by_text("Aceptar").click(timeout=2000)
+        except Exception: pass
+        page.wait_for_selector(f"{BTN_CONTINUE}, {NO_SLOTS_TEXT}", timeout=WIDGET_TIMEOUT_MS)
 
-    wait_widget_ready(widget)
-    return widget
-
-# ======================
-# Parsing de huecos
-# ======================
-
-def find_slots(page: Page) -> List[Tuple[str, str]]:
-    """
-    Devuelve lista de (hora, texto_boton) si el botón contiene una hora
-    y el mismo elemento/bloque incluye 'Hueco libre'
-    """
-    slots: List[Tuple[str,str]] = []
-
-    # 1) ¿está el mensaje de “No hay horas disponibles”?
-    if safe_wait_text(page, "No hay horas disponibles", timeout=1500):
-        return slots
-
-    # 2) buscar botones candidatos
-    # Preferimos botones que contengan “Hueco libre”
-    cand = page.locator("button:has-text('Hueco libre')")
+def wait_calendar_ready(page):
+    # si existe “Loading”, esperar a que desaparezca
     try:
-        count = cand.count()
-    except Exception:
-        count = 0
-
-    if count == 0:
-        # fallback: cualquier botón visible con hora y alguna pista
-        cand = page.locator("button")
-        try:
-            count = cand.count()
-        except Exception:
-            count = 0
-
-    for i in range(min(count, 300)):
-        try:
-            el = cand.nth(i)
-            if not el.is_visible():
-                continue
-            text = el.inner_text().strip()
-            # si no venía “Hueco libre” en la query, filtramos aquí
-            if "hueco" not in text.lower():
-                # revisar contenedor cercano por 'Hueco libre'
-                try:
-                    near = el.locator("xpath=..").inner_text().lower()
-                    if "hueco" not in near:
-                        continue
-                except Exception:
-                    continue
-            m = TIME_RE.search(text)
-            if m:
-                slots.append((m.group(0), text))
-        except Exception:
-            continue
-    return slots
-
-# ======================
-# Revisión por consulado
-# ======================
-
-def revisar_consulado(context: BrowserContext, cons: Consulado) -> Tuple[bool, List[Tuple[str,str]]]:
-    """
-    Devuelve (hay_huecos, slots)
-    """
-    name_slug = cons.nombre.lower().replace(" ", "_")
-
-    widget = open_widget_from_ministerio(context, cons)
-    hpause()
-
-    # Evidencia inicial de widget
-    if cfg.DEBUG_STEPS.upper() == "ON":
-        send_screenshot(f"{name_slug}_before_check", widget, f"{cons.nombre}: evidencia inicial (antes de parsear)")
-        send_html(f"{name_slug}_before_check", widget, f"{cons.nombre}: HTML inicial")
-
-    # Paso 1: botón Continuar
-    click_continue_if_present(widget)
-    if cfg.DEBUG_STEPS.upper() == "ON":
-        send_screenshot(f"{name_slug}_after_continue", widget, f"{cons.nombre}: pantalla tras 'Continuar'")
-        send_html(f"{name_slug}_after_continue", widget, f"{cons.nombre}: HTML tras 'Continuar'")
-
-    # Paso 2 (solo CDMX): click panel
-    click_panel_if_needed(widget, cons.panel_texto)
-    if cfg.DEBUG_STEPS.upper() == "ON":
-        send_screenshot(f"{name_slug}_after_panel", widget, f"{cons.nombre}: pantalla tras abrir panel")
-        send_html(f"{name_slug}_after_panel", widget, f"{cons.nombre}: HTML tras abrir panel")
-
-    # Buscar huecos
-    slots = find_slots(widget)
-
-    # Evidencia final
-    if cfg.DEBUG_STEPS.upper() == "ON":
-        send_screenshot(f"{name_slug}_final", widget, f"{cons.nombre}: captura final — {'OK' if slots else 'NO'}")
-        send_html(f"{name_slug}_final", widget, f"{cons.nombre}: HTML final — {'OK' if slots else 'NO'}")
-
+        if page.locator(SPINNER_LOADING).count() > 0:
+            page.locator(SPINNER_LOADING).first.wait_for(state="detached", timeout=WIDGET_TIMEOUT_MS)
+    except Exception: pass
+    # luego algo relevante del calendario
     try:
-        widget.close()
+        page.wait_for_selector(f"{CAL_CHANGE_DAY}, {SLOT_BUTTONS}, {NO_SLOTS_TEXT}", timeout=WIDGET_TIMEOUT_MS)
+    except PWTimeout:
+        page.wait_for_timeout(1200)
+
+def detect_slots(page):
+    if page.locator(NO_SLOTS_TEXT).count(): return False
+    if page.locator(SLOT_BUTTONS).count() > 0: return True
+    # heurística: HH:MM
+    try:
+        h = page.locator("text=/\\b([01]\\d|2[0-3]):[0-5]\\d\\b/")
+        if h.count() > 0: return True
+    except Exception: pass
+    return False
+
+# ========= flujos =========
+def open_from_ministry(page, cons_name, min_url, widget_url):
+    ok = goto(page, min_url, LANDING_TIMEOUT_MS)
+    if not ok: 
+        tg_text(f"{cons_name}: no abrió Ministerio"); return False
+
+    # evidencia ministerio (html)
+    html_min = OUTDIR / f"{cons_name.lower()}_ministerio.html"
+    save_html(page, html_min); tg_file(html_min, f"{cons_name}: HTML inicial (ministerio)")
+
+    # click amarillo (puede abrir nueva pestaña)
+    try:
+        with page.context.expect_page(timeout=4000) as maybe_new:
+            page.locator(MIN_YELLOW_LINK).first.click(timeout=PAGE_OP_TIMEOUT_MS)
+        return maybe_new.value
     except Exception:
         pass
 
-    return (len(slots) > 0, slots)
+    # si no abrió pestaña, vamos directo al widget
+    if not goto(page, widget_url, LANDING_TIMEOUT_MS):
+        tg_text(f"{cons_name}: no abrió Widget")
+        return False
+    return page
 
-# ======================
-# Main loop
-# ======================
+def cdmx_flow(page, name="Ciudad de México"):
+    wait_widget_ready(page)
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    img0 = OUTDIR / "cdmx_before.jpg"; shot_jpg(page, img0, full=True); tg_file(img0, f"{name}: evidencia inicial (antes de parsear)")
+    html0 = OUTDIR / "cdmx_before_check.html"; save_html(page, html0); tg_file(html0, f"{name}: HTML inicial")
+
+    try: page.locator(BTN_CONTINUE).first.click(timeout=PAGE_OP_TIMEOUT_MS)
+    except Exception: pass
+    page.wait_for_timeout(700)
+    html1 = OUTDIR / "ciudad_de_méxico_after_continue.html"; save_html(page, html1); tg_file(html1, f"{name}: HTML tras 'Continuar'")
+
+    page.wait_for_timeout(600)
+    try: page.locator(CDMX_PANEL).first.click(timeout=PAGE_OP_TIMEOUT_MS)
+    except Exception: pass
+
+    # robustez extra
+    for _ in range(3):
+        try: wait_calendar_ready(page); break
+        except Exception:
+            page.mouse.wheel(0,800); page.wait_for_timeout(1000)
+
+    htmlf = OUTDIR / "ciudad_de_méxico_final.html"; save_html(page, htmlf)
+    capf  = OUTDIR / "ciudad_de_méxico_final.jpg"; shot_jpg(page, capf, full=True)
+    tg_file(htmlf, f"{name}: HTML final — {'NO' if page.locator(NO_SLOTS_TEXT).count() else 'OK?'}")
+    tg_file(capf,  f"{name}: captura final — {'NO' if page.locator(NO_SLOTS_TEXT).count() else '¿HUECOS?'}")
+    return detect_slots(page)
+
+def monterrey_flow(page, name="Monterrey"):
+    wait_widget_ready(page)
+
+    img0 = OUTDIR / "monterrey_before.jpg"; shot_jpg(page, img0, full=True); tg_file(img0, f"{name}: evidencia inicial (widget listo)")
+    html0 = OUTDIR / "monterrey_before_check.html"; save_html(page, html0); tg_file(html0, f"{name}: HTML inicial (widget listo)")
+
+    try: page.locator(BTN_CONTINUE).first.click(timeout=PAGE_OP_TIMEOUT_MS)
+    except Exception: pass
+    page.wait_for_timeout(700)
+    html1 = OUTDIR / "monterrey_after_continue.html"; save_html(page, html1); tg_file(html1, f"{name}: HTML tras 'Continuar'")
+
+    # si aparece el mismo panel que CDMX, clic
+    try:
+        if page.locator(CDMX_PANEL).count(): page.locator(CDMX_PANEL).first.click(timeout=PAGE_OP_TIMEOUT_MS)
+    except Exception: pass
+
+    # Esperas sólidas para evitar la “captura final” con spinner
+    for _ in range(3):
+        try:
+            wait_calendar_ready(page)
+            break
+        except Exception:
+            page.mouse.wheel(0, 800); page.wait_for_timeout(1200)
+
+    htmlf = OUTDIR / "monterrey_final.html"; save_html(page, htmlf)
+    capf  = OUTDIR / "monterrey_final.jpg"; shot_jpg(page, capf, full=True)
+    tg_file(htmlf, f"{name}: HTML final — {'NO' if page.locator(NO_SLOTS_TEXT).count() else 'OK?'}")
+    tg_file(capf,  f"{name}: captura final — {'NO' if page.locator(NO_SLOTS_TEXT).count() else '¿HUECOS?'}")
+    return detect_slots(page)
+
+CONSULADOS = [
+    {"name":"Monterrey",       "min":MIN_MTY,  "widget":WIDGET_MTY,  "run":monterrey_flow},
+    {"name":"Ciudad de México","min":MIN_CDMX, "widget":WIDGET_CDMX, "run":cdmx_flow},
 ]
 
-def new_context(play, headless=True) -> BrowserContext:
-    args = context_args_for_proxy()
-    browser = play.chromium.launch(headless=headless)
-    viewport = {"width": random.randint(1200, 1440), "height": random.randint(850, 980)}
+# ========= lanzamiento robusto =========
+def launch_browser(pw):
+    proxy = build_proxy()
+    # Nota: en Railway el sandbox está deshabilitado por defecto para Playwright build de runtime
+    browser = pw.chromium.launch(headless=True)
     context = browser.new_context(
-        viewport=viewport,
-        user_agent=random.choice(USER_AGENTS),
-        locale="es-ES",
-        **args
+        proxy=proxy if proxy else None,
+        viewport={"width":1280,"height":900},
+        java_script_enabled=True,
+        bypass_csp=True,
     )
-    # Opcional: bloquear imágenes
-    if cfg.BLOCK_IMAGES.upper() == "ON":
-        context.route("**/*", lambda route: route.abort() if route.request.resource_type in ("image","media","font") else route.continue_())
-    return context
+    if BLOCK_IMAGES:
+        context.route("**/*", lambda route: route.abort() if route.request.resource_type == "image" else route.continue_())
+    return browser, context
 
-def show_public_ip_once():
-    if cfg.SHOW_PUBLIC_IP.upper() != "ON":
-        return
-    try:
-        ip = requests.get("https://api.ipify.org?format=json", timeout=12).json().get("ip","")
-        t_send_message(f"[INFO] IP pública: {ip}")
-    except Exception:
-        pass
+def print_cfg():
+    tg_text(f"[INFO] Config: debug={DEBUG_STEPS} block_images={'ON' if BLOCK_IMAGES else 'OFF'}")
+    tg_text(f"[INFO] Consulados: Monterrey, Ciudad de México")
+    prox = f"http://{PROXY_HOST}:{PROXY_PORT}" if PROXY_HOST else "sin proxy"
+    tg_text(f"[INFO] Proxy: {prox}")
+    if SHOW_PUBLIC_IP:
+        try:
+            ip = requests.get(IP_ENDPOINT, timeout=8).text.strip()
+            tg_text(f"[INFO] IP pública: {ip}")
+        except Exception: pass
+
+def is_target_closed_error(e: Exception) -> bool:
+    s = repr(e)
+    return ("Target page, context or browser has been closed" in s) or ("Target closed" in s)
+
+def run_round(context):
+    for cons in CONSULADOS:
+        name, min_url, widget_url, runner = cons["name"], cons["min"], cons["widget"], cons["run"]
+        page = context.new_page()
+        try:
+            target = open_from_ministry(page, name, min_url, widget_url)
+            if target is False:
+                tg_text(f"[{name}] {now()} → error al abrir ministerio/widget.")
+                try: page.close()
+                except Exception: pass
+                continue
+
+            if target != page:
+                # se abrió nueva pestaña
+                try: page.close()
+                except Exception: pass
+                page = target
+
+            has = runner(page, name)
+            tg_text(f"[{name}] {now()} {'→ HUECOS detectados' if has else '→ sin huecos por ahora.'}")
+
+        except Exception as e:
+            # Evidencia del fallo y mensaje
+            try:
+                err_html = OUTDIR / f"{name.lower()}_after_panel_fail.html"
+                save_html(page, err_html); tg_file(err_html, f"{name}: HTML tras intentar abrir panel")
+                err_img  = OUTDIR / f"{name.lower()}_after_panel.jpg"
+                shot_jpg(page, err_img, full=True); tg_file(err_img, f"{name}: pantalla tras intentar abrir panel")
+            except Exception: pass
+            tg_text(f"⚠️ {name}: error durante la revisión.\n{repr(e)}\n{traceback.format_exc()[:1200]}")
+            if is_target_closed_error(e):
+                raise   # que lo maneje el nivel superior para relanzar navegador
+        finally:
+            try: page.close()
+            except Exception: pass
 
 def main():
-    t_send_message("[start] Launching bot…")
-    t_send_message(f"[INFO] Config: proof={'ON' if cfg.DEBUG_STEPS=='ON' else 'OFF'} debug=ON block_images={cfg.BLOCK_IMAGES}")
-    if cfg.PROXY_HOST:
-        t_send_message(f"[INFO] Proxy: http://{cfg.PROXY_HOST}:{cfg.PROXY_PORT}")
+    print_cfg()
+    rounds = 0
+    with sync_playwright() as pw:
+        browser = None
+        context = None
 
-    show_public_ip_once()
+        def open_session():
+            nonlocal browser, context
+            # backoff en launch
+            for i in range(LAUNCH_RETRY_MAX):
+                try:
+                    browser, context = launch_browser(pw)
+                    return True
+                except Exception as e:
+                    delay = LAUNCH_RETRY_BASE_DELAY * (2 ** i)
+                    tg_text(f"[ERROR] launch falló (intento {i+1}/{LAUNCH_RETRY_MAX}). Esperando {delay}s.\n{repr(e)}")
+                    time.sleep(delay)
+            return False
 
-    with sync_playwright() as p:
+        if not open_session():
+            tg_text("[FATAL] No se pudo lanzar el navegador.")
+            return
+
         while True:
             try:
-                ctx = new_context(p, headless=True)
-                t_send_message(f"[INFO] Consulados: {', '.join(c.nombre for c in cfg.CONSULADOS)}")
-
-                for cons in cfg.CONSULADOS:
-                    t_send_message(f"[{cons.nombre}] goto…")
-                    ok, slots = revisar_consulado(ctx, cons)
-                    if ok and slots:
-                        horas = ", ".join(sorted({h for h, _ in slots})[:6])
-                        msg = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {cons.nombre} → ¡HAY HUECOS! Horas: {horas}"
-                        t_send_message(msg)
-                        # Enfriar 5 min si hay huecos, para no “machacar”
-                        time.sleep(300)
-                    else:
-                        t_send_message(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {cons.nombre} → sin huecos por ahora.")
-
-                    hpause(1.2, 2.0)
-
-                try:
-                    ctx.close()
-                except Exception:
-                    pass
-
-                # Espera humana entre rondas
-                wait_s = random.randint(cfg.ROUND_MIN_S, cfg.ROUND_MAX_S)
-                t_send_message(f"[INFO] Esperando {wait_s}s antes de la siguiente ronda…")
-                time.sleep(wait_s)
-
+                run_round(context)
+                rounds += 1
             except Exception as e:
-                t_send_message(f"[ERROR] {e}")
-                time.sleep(90)
+                if is_target_closed_error(e):
+                    # relanzar navegador
+                    try:
+                        if context: context.close()
+                    except Exception: pass
+                    try:
+                        if browser: browser.close()
+                    except Exception: pass
+                    tg_text("[warn] Sesión cerrada/crashed. Relanzando navegador…")
+                    if not open_session():
+                        tg_text("[FATAL] No se pudo relanzar el navegador.")
+                        break
+                else:
+                    # error no fatal, continuamos
+                    tg_text(f"[warn] Error no fatal, seguimos. {repr(e)}")
+
+            # reinicio preventivo por salud
+            if rounds > 0 and (rounds % ROUNDS_PER_RESTART == 0):
+                tg_text("[INFO] Reinicio preventivo del navegador para liberar memoria.")
+                try:
+                    context.close(); browser.close()
+                except Exception: pass
+                if not open_session():
+                    tg_text("[FATAL] No se pudo relanzar tras reinicio preventivo.")
+                    break
+
+            # espera humanizada
+            wait_s = random.randint(ROUND_MIN_WAIT, ROUND_MAX_WAIT)
+            tg_text(f"[INFO] Esperando {wait_s}s antes de la siguiente ronda…")
+            time.sleep(wait_s)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
