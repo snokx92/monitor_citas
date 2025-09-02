@@ -1,63 +1,80 @@
+# monitor_citas_multiconsulados.py
 # -*- coding: utf-8 -*-
-import os, sys, time, random, re, io, traceback, json
+
+import os, sys, time, random, re, io, json
 from dataclasses import dataclass
-from typing import Optional, Tuple, List, Dict
-from playwright.sync_api import sync_playwright, TimeoutError as PTimeout, Page, Browser, BrowserContext
+from typing import List, Tuple, Optional
 import requests
+from playwright.sync_api import sync_playwright, TimeoutError as PTimeout, Error as PError
 
-# ------------------------------------------------------------
-# Config
-# ------------------------------------------------------------
+# =========================
+#  CONFIG
+# =========================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-
-# Envío de evidencias (activado por defecto)
-SEND_PROOF = os.getenv("PROOF", "ON").strip().upper() != "OFF"
-
-# Bloquear imágenes (ahorra datos)
-BLOCK_IMAGES = os.getenv("BLOCK_IMAGES", "ON").strip().upper() == "ON"
-
-# Retrasos "humanos"
-HUMAN_MIN = float(os.getenv("HUMAN_MIN", "0.7"))
-HUMAN_MAX = float(os.getenv("HUMAN_MAX", "1.4"))
-
-# Reintentos básicos de goto / esperas
-GOTO_RETRIES = int(os.getenv("GOTO_RETRIES", "2"))
-LANDING_TIMEOUT_MS = int(os.getenv("LANDING_TIMEOUT_MS", "30000"))
-WIDGET_TIMEOUT_MS  = int(os.getenv("WIDGET_TIMEOUT_MS",  "25000"))
-
-# Patrón de hora visible en botón/slot
 TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")  # 0:00–23:59
 
 @dataclass
 class Consulado:
     name: str
-    # URL externa (exteriores.gob.es) desde donde se abre el widget (t.me → abre en pestaña nueva)
+    # Página “externa” del MAEC con el enlace ELEGIR FECHA Y HORA
     landing_url: str
-    # Texto/enlace que abre el widget (ancla amarillo "ELEGIR FECHA Y HORA")
+    # Texto del enlace que abre el widget (abre nueva pestaña)
     landing_link_text: str = "ELEGIR FECHA Y HORA"
-    # Estrategia: "default" (Monterrey) o "cdmx_panel" (flujo especial CDMX)
-    strategy: str = "default"
+    # ¿Hay panel intermedio que abrir dentro del widget (CDMX)?
+    needs_panel_click: bool = False
+    panel_text: str = "PRESENTACION DOCUMENTACION LEY MEMORIA DEMOCRATICA"
 
+# ---- Consulados (respetando tu base; Monterrey + CDMX) ----
 CONSULADOS: List[Consulado] = [
     Consulado(
         name="Monterrey",
         landing_url="https://www.exteriores.gob.es/Consulados/monterrey/es/ServiciosConsulares/Paginas/CitaNacionalidadLMD.aspx",
-        strategy="default",
+        needs_panel_click=False,
     ),
     Consulado(
         name="Ciudad de México",
         landing_url="https://www.exteriores.gob.es/Consulados/mexico/es/ServiciosConsulares/Paginas/CitaNacionalidadLMD.aspx",
-        strategy="cdmx_panel",
+        needs_panel_click=True,
+        panel_text="PRESENTACION DOCUMENTACION LEY MEMORIA DEMOCRATICA",
     ),
 ]
 
-# ------------------------------------------------------------
-# Notificaciones
-# ------------------------------------------------------------
+# ---- Variables entorno (mismas claves que ya usas) ----
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-def tg_send_text(text: str):
+PROOF              = os.getenv("PROOF", "1") == "1"          # enviar evidencias a Telegram
+SHOW_PUBLIC_IP     = os.getenv("SHOW_PUBLIC_IP", "1") == "1"
+BLOCK_IMAGES       = os.getenv("BLOCK_IMAGES", "1") == "1"
+DEBUG_STEPS        = os.getenv("DEBUG_STEPS", "1") == "1"
+
+# tiempo máximo al esperar que cargue “algo” en el widget
+WIDGET_TIMEOUT_MS  = int(os.getenv("WIDGET_TIMEOUT_MS", "18000"))
+LANDING_TIMEOUT_MS = int(os.getenv("LANDING_TIMEOUT_MS", "20000"))
+
+# reintentos de goto cuando algo tarda
+GOTO_RETRIES       = int(os.getenv("GOTO_RETRIES", "2"))
+
+# espera humanizada entre rondas
+WAIT_MIN_SEC       = int(os.getenv("WAIT_MIN_SEC", "300"))   # 5 min
+WAIT_MAX_SEC       = int(os.getenv("WAIT_MAX_SEC", "420"))   # 7 min
+
+# rotación tras detectar HTML en blanco
+ROTATE_AFTER_BLANK = os.getenv("ROTATE_AFTER_BLANK", "1") == "1"
+ROTATE_COOLDOWN_SEC= int(os.getenv("ROTATE_COOLDOWN_SEC", "20"))
+
+# Proxy (HTTP) – DataImpulse
+PROXY_HOST         = os.getenv("PROXY_HOST", "").strip()
+PROXY_PORT         = os.getenv("PROXY_PORT", "").strip() or "823"
+PROXY_USER         = os.getenv("PROXY_USER", "").strip()
+PROXY_PASS         = os.getenv("PROXY_PASS", "").strip()
+PROXY_SESSION_IN_USER = os.getenv("PROXY_SESSION_IN_USER", "0") == "1"  # si agregas _cr.xx a user
+
+# =========================
+#  Telegram helpers
+# =========================
+
+def tg_send_message(text: str):
     print(text, flush=True)
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
@@ -65,335 +82,330 @@ def tg_send_text(text: str):
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"[WARN] Telegram MSG failed: {e}", file=sys.stderr)
+
+def tg_send_file(caption: str, filename: str, data: bytes, mime: str = "text/html"):
+    print(f"[proof] file -> {filename}", flush=True)
+    if not PROOF or not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    files = {"document": (filename, data, mime)}
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+            files=files,
             timeout=20,
         )
     except Exception as e:
-        print(f"[WARN] Telegram text fail: {e}", file=sys.stderr)
+        print(f"[WARN] Telegram FILE failed: {e}", file=sys.stderr)
 
-def tg_send_document(filepath: str, caption: str):
-    print(f"[proof] file → {filepath} / {caption}", flush=True)
-    if not SEND_PROOF or not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+def tg_send_png(caption: str, image_bytes: bytes):
+    print(f"[proof] photo -> {caption}", flush=True)
+    if not PROOF or not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
+    files = {"photo": ("evidence.png", image_bytes, "image/png")}
     try:
-        with open(filepath, "rb") as f:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
-                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
-                files={"document": (os.path.basename(filepath), f, "application/octet-stream")},
-                timeout=30,
-            )
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+            files=files,
+            timeout=20,
+        )
     except Exception as e:
-        print(f"[WARN] Telegram document fail: {e}", file=sys.stderr)
+        print(f"[WARN] Telegram PHOTO failed: {e}", file=sys.stderr)
 
-def tg_send_photo(filepath: str, caption: str):
-    print(f"[proof] image → {filepath} / {caption}", flush=True)
-    if not SEND_PROOF or not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        return
+# =========================
+#  Utilidades
+# =========================
+
+def human_pause(a=0.7, b=1.6):
+    time.sleep(random.uniform(a, b))
+
+def public_ip_text() -> Optional[str]:
     try:
-        with open(filepath, "rb") as f:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
-                files={"photo": (os.path.basename(filepath), f, "image/png")},
-                timeout=30,
-            )
-    except Exception as e:
-        print(f"[WARN] Telegram photo fail: {e}", file=sys.stderr)
+        r = requests.get("https://api.ipify.org?format=json", timeout=12)
+        return r.json().get("ip")
+    except Exception:
+        return None
 
-# ------------------------------------------------------------
-# Utilidades
-# ------------------------------------------------------------
+def mk_session_user(base: str) -> str:
+    if PROXY_SESSION_IN_USER:
+        # agrega un sufijo de sesión (“sticky” por unos minutos, DataImpulse)
+        suf = random.randint(11, 99)
+        return f"{base}_cr.us,mx:{suf}"
+    return base
 
-def human_pause(a: float = None, b: float = None):
-    lo = HUMAN_MIN if a is None else a
-    hi = HUMAN_MAX if b is None else b
-    time.sleep(random.uniform(lo, hi))
+def mk_proxy_kwargs():
+    if not PROXY_HOST or not PROXY_PORT:
+        return {}
+    server = f"http://{PROXY_HOST}:{PROXY_PORT}"
+    proxy = {"server": server}
+    if PROXY_USER and PROXY_PASS:
+        proxy["username"] = mk_session_user(PROXY_USER)
+        proxy["password"] = PROXY_PASS
+    return {"proxy": proxy}
 
-def save_html(page: Page, path: str):
+def save_html(page, caption_prefix: str, tag: str, cons_name: str):
+    html = page.content().encode("utf-8", "ignore")
+    fname = f"{cons_name.lower().replace(' ', '_')}_{tag}.html"
+    tg_send_file(f"{cons_name}: {caption_prefix}", fname, html)
+    return html
+
+def save_screenshot(page, caption: str):
+    try:
+        png = page.screenshot(full_page=True)
+        tg_send_png(caption, png)
+    except Exception:
+        pass
+
+def any_visible(page, locators: List):
+    """Espera a que cualquiera de los locators sea visible (o agota timeout)."""
+    deadline = time.time() + (WIDGET_TIMEOUT_MS / 1000)
+    last_err = None
+    while time.time() < deadline:
+        for loc in locators:
+            try:
+                if loc.count() > 0:
+                    if loc.first.is_visible():
+                        return loc
+            except Exception as e:
+                last_err = e
+        human_pause(0.3, 0.6)
+    if last_err:
+        raise last_err
+    raise PTimeout("any_visible timeout")
+
+# =========================
+#  Parser de huecos (robusto)
+# =========================
+
+def detect_no_hay_horas(page) -> bool:
+    # Evita strict mode: usa count() y no wait_for
+    try:
+        c = page.get_by_text("No hay horas disponibles", exact=False).count()
+        return c > 0
+    except Exception:
+        return False
+
+def extract_slots_robusto(page) -> List[str]:
+    """
+    Heurística robusta:
+      1) Si aparece “No hay horas disponibles” -> NO huecos, []
+      2) Si hay “Hueco libre” en el HTML -> huecos (extrae horas si existen)
+      3) Si no, pero aparecen horas (HH:MM) -> asume huecos (Bookitit muestra horas solo cuando hay slots)
+    Devuelve lista de horas únicas (strings).
+    """
     try:
         html = page.content()
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(html)
     except Exception:
-        pass
+        return []
 
-def save_screenshot(page: Page, path: str):
-    try:
-        page.screenshot(path=path, full_page=True)
-    except Exception:
-        pass
+    # 1) negación explícita
+    if re.search(r"No\s+hay\s+horas\s+disponibles", html, re.I):
+        return []
 
-def accept_dialogs(context: BrowserContext):
+    horas = re.findall(TIME_RE, html)
+    horas_norm = [h if isinstance(h, str) else h[0] for h in horas]
+    horas_norm = list(dict.fromkeys(horas_norm))  # únicas, preserva orden
+
+    # 2) pista fuerte “Hueco libre”
+    if re.search(r"Hueco\s+libre", html, re.I):
+        # si no detectamos horas por alguna razón, lo marcamos igualmente
+        return horas_norm if horas_norm else ["(sin hora visible)"]
+
+    # 3) no hay negación y hay horas en la página -> marcar huecos
+    if horas_norm:
+        return horas_norm
+
+    # fallback: buscar “disponible(s)”
+    if re.search(r"disponible", html, re.I):
+        return ["(disponible)"]
+
+    return []
+
+# =========================
+#  Flujo del widget
+# =========================
+
+def goto_with_retries(page, url: str, timeout_ms: int):
+    last = None
+    for i in range(GOTO_RETRIES):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            return
+        except Exception as e:
+            last = e
+            human_pause(1.0, 2.0)
+    raise last or PTimeout(f"goto retries exhausted for {url}")
+
+def open_widget_from_landing(context, cons: Consulado):
+    """
+    Abre la página del MAEC y hace click en “ELEGIR FECHA Y HORA”, capturando el popup (widget).
+    Devuelve la página del widget.
+    """
+    page = context.new_page()
+    goto_with_retries(page, cons.landing_url, LANDING_TIMEOUT_MS)
+
+    # Captura evidencia inicial (landing) solo si debug
+    if DEBUG_STEPS and PROOF:
+        save_screenshot(page, f"{cons.name}: evidencia inicial (landing)")
+
+    link = page.get_by_text(cons.landing_link_text, exact=False)
+    with page.expect_popup() as pop:
+        link.first.click(force=True)
+    widget_page = pop.value
+
+    # Aceptar dialog de “Welcome / Bienvenido”
     def _on_dialog(d):
         try:
             d.accept()
         except Exception:
             pass
-    context.on("dialog", _on_dialog)
+    widget_page.on("dialog", _on_dialog)
 
-def set_request_blocking(context: BrowserContext):
-    if not BLOCK_IMAGES:
-        return
-    def _route(route, request):
-        if request.resource_type in ("image", "media", "font"):
-            return route.abort()
-        return route.continue_()
-    context.route("**/*", _route)
+    # Dejar que cargue
+    goto_with_retries(widget_page, widget_page.url, WIDGET_TIMEOUT_MS)
 
-# ------------------------------------------------------------
-# Apertura de widget desde exteriores (abre nueva pestaña)
-# ------------------------------------------------------------
+    return page, widget_page
 
-def open_widget_from_landing(context: BrowserContext, landing_url: str, link_text: str) -> Page:
-    page = context.new_page()
-    page.set_default_timeout(LANDING_TIMEOUT_MS)
-    page.goto(landing_url, wait_until="domcontentloaded")
-    human_pause()
-
-    # clic en ancla "ELEGIR FECHA Y HORA" — abre en nueva pestaña
-    with context.expect_page() as p_ev:
-        # intenta con el texto exacto / en mayúsculas
-        link = page.get_by_text(link_text, exact=False)
-        link.first.click(force=True, timeout=LANDING_TIMEOUT_MS)
-    widget_page = p_ev.value
-    widget_page.set_default_timeout(WIDGET_TIMEOUT_MS)
-
-    # espera a que el widget cargue algo (HTML no vacío)
-    widget_page.wait_for_load_state("domcontentloaded")
-    human_pause(0.6, 1.4)
-    return widget_page
-
-# ------------------------------------------------------------
-# Obtención de slots/huecos
-# ------------------------------------------------------------
-
-def extract_real_slots(page: Page) -> List[Tuple[str, str]]:
-    """Devuelve (hora, texto_boton) para botones con 'Hueco libre'"""
-    slots = []
-    try:
-        cands = page.locator("button, .btn, [role=button]")
-        n = cands.count()
-    except Exception:
-        n = 0
-
-    for i in range(min(n, 300)):
-        try:
-            el = cands.nth(i)
-            if not el.is_visible():
-                continue
-            txt = el.inner_text().strip()
-            if not txt or "hueco libre" not in txt.lower():
-                continue
-            m = TIME_RE.search(txt)
-            if m:
-                slots.append((m.group(0), txt))
-        except Exception:
-            continue
-    return slots
-
-# ------------------------------------------------------------
-# Flujo genérico (Monterrey / default)
-# ------------------------------------------------------------
-
-def revisar_default(context: BrowserContext, cons: Consulado) -> Tuple[bool, List[Tuple[str, str]], Optional[str]]:
-    """Abrimos desde exteriores, aceptamos bienvenida si aparece y revisamos directamente."""
-    page = open_widget_from_landing(context, cons.landing_url, cons.landing_link_text)
-    human_pause()
-
-    # evidencia inicial
-    if SEND_PROOF:
-        pfx = cons.name.replace(" ", "_").lower()
-        save_html(page, f"{pfx}_init_widget.html")
-        tg_send_document(f"{pfx}_init_widget.html", f"{cons.name}: HTML inicial (widget listo)")
-        save_screenshot(page, f"{pfx}_init_widget.png")
-        tg_send_photo(f"{pfx}_init_widget.png", f"{cons.name}: evidencia inicial (widget listo)")
-
-    # botón Continuar si existe
-    try:
-        btn = page.locator("button:has-text('Continuar'), button:has-text('Continue')")
-        if btn.first.is_visible():
-            btn.first.click(force=True, timeout=6000)
-            human_pause()
-    except Exception:
-        pass
-
-    # chequeo de "no hay horas"
-    try:
-        page.get_by_text("No hay horas disponibles", exact=False).wait_for(timeout=2500)
-        fecha = None
-        return (False, [], fecha)
-    except PTimeout:
-        pass
-
-    # buscar huecos
-    slots = extract_real_slots(page)
-    fecha = None
-    ok = len(slots) > 0
-
-    if SEND_PROOF:
-        pfx = cons.name.replace(" ", "_").lower()
-        save_html(page, f"{pfx}_final.html")
-        tg_send_document(f"{pfx}_final.html", f"{cons.name}: HTML final — {'OK' if ok else 'NO'}")
-        save_screenshot(page, f"{pfx}_final.png")
-        tg_send_photo(f"{pfx}_final.png", f"{cons.name}: captura final — {'OK' if ok else 'NO'}")
-
-    return (ok, slots, fecha)
-
-# ------------------------------------------------------------
-# Flujo especial Ciudad de México (bienvenida → continuar → panel)
-# ------------------------------------------------------------
-
-def revisar_cdmx_panel(context: BrowserContext, cons: Consulado) -> Tuple[bool, List[Tuple[str, str]], Optional[str]]:
+def revisar_consulado(context, cons: Consulado) -> Tuple[bool, List[str]]:
     """
-    Pasos específicos:
-      1) Bienvenida (se acepta automáticamente por handler de dialogs)
-      2) Click en “Continuar / Continue”
-      3) Esperar y click en el recuadro “PRESENTACION DOCUMENTACION LEY MEMORIA DEMOCRATICA”
-      4) Chequeo final de huecos (“No hay horas…” o botones con Hueco libre)
+    Core: entra al widget, pulsa “Continuar”, (CDMX) abre panel, y decide huecos.
+    Devuelve (ok, horas[])
     """
-    page = open_widget_from_landing(context, cons.landing_url, cons.landing_link_text)
-    human_pause()
+    landing, page = open_widget_from_landing(context, cons)
+    human_pause(0.8, 1.6)
 
-    # Evidencia 0: antes de parsear
-    if SEND_PROOF:
-        pfx = "ciudad_de_mexico"
-        save_html(page, f"{pfx}_before_check_widget.html")
-        tg_send_document(f"{pfx}_before_check_widget.html", "Ciudad de México: HTML inicial (widget listo)")
-        save_screenshot(page, f"{pfx}_before_check_widget.png")
-        tg_send_photo(f"{pfx}_before_check_widget.png", "Ciudad de México: evidencia inicial (antes de parsear)")
+    # Bloquea imágenes para ahorrar ancho de banda si se pidió
+    if BLOCK_IMAGES:
+        page.route("**/*", lambda route: route.abort() if route.request.resource_type == "image" else route.continue_())
 
-    # Paso 2: boton Continuar
+    # Evidencia “widget listo”
+    if PROOF:
+        save_html(page, "HTML inicial (widget listo)", "check_widget", cons.name)
+        save_screenshot(page, f"{cons.name}: evidencia inicial (widget listo)")
+
+    # 1) Click en “Continuar”
     try:
-        btn = page.locator("button:has-text('Continuar'), button:has-text('Continue')")
-        if btn.first.is_visible():
-            btn.first.click(force=True, timeout=7000)
-            human_pause(0.9, 1.6)
+        any_visible(page, [
+            page.get_by_text("Continue / Continuar", exact=False),
+            page.get_by_text("Continuar", exact=False),
+            page.locator("text=Continuar"),
+        ]).first.click(force=True)
     except Exception:
+        # Si no aparece el botón, en algunos flujos ya estás “dentro”
         pass
 
-    # Evidencia 1: tras continuar
-    if SEND_PROOF:
-        save_html(page, "ciudad_de_mexico_after_continue.html")
-        tg_send_document("ciudad_de_mexico_after_continue.html", "Ciudad de México: HTML tras 'Continuar'")
-        save_screenshot(page, "ciudad_de_mexico_after_continue.png")
-        tg_send_photo("ciudad_de_mexico_after_continue.png", "Ciudad de México: pantalla tras 'Continuar'")
+    human_pause(0.6, 1.1)
 
-    # Paso 3: click en el recuadro (panel) — intentamos varios selectores de respaldo
-    panel_clicked = False
-    panel_text = "PRESENTACION DOCUMENTACION LEY MEMORIA DEMOCRATICA"
-
-    # a) por texto exacto (insensible a mayúsculas)
-    try:
-        loc = page.get_by_text(panel_text, exact=False)
-        if loc.first.is_visible():
-            loc.first.click(force=True, timeout=7000)
-            panel_clicked = True
-    except Exception:
-        pass
-
-    # b) por posibles contenedores
-    if not panel_clicked:
+    # 2) (CDMX) abrir panel grande
+    if cons.needs_panel_click:
         try:
-            cands = page.locator(".panel, .panel-default, .panel-body, .well, .list-group-item, .list-group a")
-            n = cands.count()
-            for i in range(min(n, 12)):
-                el = cands.nth(i)
-                if not el.is_visible():
-                    continue
-                txt = el.inner_text().strip()
-                if "memoria" in txt.lower() or "presentacion" in txt.lower():
-                    el.click(force=True, timeout=6000)
-                    panel_clicked = True
-                    break
+            # espera que aparezca la tarjeta/panel con ese texto y haz click amplio
+            any_visible(page, [
+                page.get_by_text(cons.panel_text, exact=False),
+                page.locator(f"text={cons.panel_text}")
+            ]).first.click(position={"x": 30, "y": 30})
+            human_pause(0.8, 1.4)
         except Exception:
+            # si no aparece, seguimos (a veces se abre directo)
             pass
 
-    # c) último esfuerzo: clic centrado de la zona de contenido
-    if not panel_clicked:
-        try:
-            page.mouse.click(600, 340)  # heurístico
-            panel_clicked = True
-        except Exception:
-            pass
-
-    human_pause(0.9, 1.6)
-
-    # Evidencia 2: tras intentar abrir el panel
-    if SEND_PROOF:
-        save_html(page, "ciudad_de_mexico_after_panel.html")
-        tg_send_document("ciudad_de_mexico_after_panel.html", "Ciudad de México: HTML tras abrir panel")
-        save_screenshot(page, "ciudad_de_mexico_after_panel.png")
-        tg_send_photo("ciudad_de_mexico_after_panel.png", "Ciudad de México: pantalla tras abrir panel")
-
-    # Paso 4: chequeo final (no hay horas vs slots)
+    # Esperar a que aparezca algo “determinante”: o el texto de no-disponibilidad o alguna hora
     try:
-        page.get_by_text("No hay horas disponibles", exact=False).wait_for(timeout=2500)
-        return (False, [], None)
-    except PTimeout:
-        pass
+        any_visible(page, [
+            page.get_by_text("No hay horas disponibles", exact=False),
+            page.locator(":text-matches('\\b([01]?\\d|2[0-3]):[0-5]\\d\\b')"),
+        ])
+    except Exception:
+        # como evidencia, por si quedó “Loading…”
+        if PROOF:
+            save_screenshot(page, f"{cons.name}: pantalla tras intentar abrir panel")
+            save_html(page, "HTML tras intentar abrir panel", "after_panel_fail", cons.name)
 
-    slots = extract_real_slots(page)
-    ok = len(slots) > 0
+    # Evidencia final
+    if PROOF:
+        save_screenshot(page, f"{cons.name}: captura final")
+        save_html(page, "HTML final", "final", cons.name)
 
-    # Evidencia 3: final
-    if SEND_PROOF:
-        save_html(page, "ciudad_de_mexico_final.html")
-        tg_send_document("ciudad_de_mexico_final.html", f"Ciudad de México: HTML final — {'OK' if ok else 'NO'}")
-        save_screenshot(page, "ciudad_de_mexico_final.png")
-        tg_send_photo("ciudad_de_mexico_final.png", f"Ciudad de México: captura final — {'OK' if ok else 'NO'}")
+    # ---- Decisión de huecos ----
+    if detect_no_hay_horas(page):
+        return False, []
 
-    return (ok, slots, None)
+    horas = extract_slots_robusto(page)
+    return (len(horas) > 0), horas
 
-# ------------------------------------------------------------
-# Bucle de monitoreo
-# ------------------------------------------------------------
+# =========================
+#  MAIN LOOP
+# =========================
 
-def revisar_consulado(context: BrowserContext, cons: Consulado) -> Tuple[bool, List[Tuple[str, str]], Optional[str]]:
-    if cons.strategy == "cdmx_panel":
-        return revisar_cdmx_panel(context, cons)
-    return revisar_default(context, cons)
+def build_launch_args():
+    args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+    ]
+    if BLOCK_IMAGES:
+        # (ya bloqueamos por route, pero este flag ahorra algo en chromium)
+        args.append("--blink-settings=imagesEnabled=false")
+    return args
 
 def main():
-    # Mensaje de prueba si FORCED TEST
-    if os.getenv("FORCE_TEST") == "1":
-        tg_send_text("🚀 Test OK: evidencias e IP activadas.")
-        time.sleep(2)
-        return
+    if SHOW_PUBLIC_IP:
+        ip = public_ip_text()
+        if ip:
+            tg_send_message(f"[INFO] IP pública: {ip}")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-gpu", "--no-sandbox"])
-        context = browser.new_context(viewport={"width": 1280, "height": 900}, locale="es-ES")
-        accept_dialogs(context)
-        set_request_blocking(context)
+    proxy_kwargs = mk_proxy_kwargs()
+    if proxy_kwargs:
+        s = proxy_kwargs["proxy"]["server"]
+        tg_send_message(f"[INFO] Proxy: {s}")
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=build_launch_args(),
+            **proxy_kwargs
+        )
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            locale="es-ES",
+            user_agent=random.choice([
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
+            ])
+        )
+
+        tg_send_message(f"[INFO] Consulados: {', '.join([c.name for c in CONSULADOS])}")
 
         while True:
             try:
-                tg_send_text(f"[INFO] Consulados: {', '.join(c.name for c in CONSULADOS)}")
-
                 for cons in CONSULADOS:
-                    human_pause(0.9, 1.6)
-                    try:
-                        ok, slots, _ = revisar_consulado(context, cons)
-                        if ok and slots:
-                            primeras = ", ".join(sorted({h for h, _ in slots})[:5])
-                            tg_send_text(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {cons.name} → ¡HAY HUECOS! Horas: {primeras}")
-                        else:
-                            tg_send_text(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {cons.name} → sin huecos por ahora.")
-                    except Exception as e:
-                        tg_send_text(f"⚠️ {cons.name}: error durante la revisión. {e}")
-                        traceback.print_exc()
+                    print(f"[{cons.name}] goto…", flush=True)
+                    ok, horas = revisar_consulado(context, cons)
 
-                # Espera humana entre rondas (pide ~5–7 min)
-                wait_sec = random.randint(300, 420)
-                tg_send_text(f"[INFO] Esperando {wait_sec}s antes de la siguiente ronda…")
-                time.sleep(wait_sec)
+                    if ok and horas:
+                        primeras = ", ".join(horas[:5])
+                        tg_send_message(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {cons.name} → ¡HUECOS! Horas: {primeras}")
+                        # enfría 5 min para darte tiempo real de entrar
+                        time.sleep(300)
+                    else:
+                        tg_send_message(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {cons.name} → sin huecos por ahora.")
+
+                    human_pause(0.8, 1.5)
 
             except Exception as e:
-                tg_send_text(f"[ERROR] ciclo principal: {e}")
-                time.sleep(90)
+                # errores amplios (incluye strict mode, timeouts, etc.)
+                tg_send_message(f"⚠️ Error general: {e}")
+                time.sleep(15)
 
-        # Nunca llega aquí en modo loop
-        # context.close(); browser.close()
+            # espera humanizada entre rondas
+            wt = random.randint(WAIT_MIN_SEC, WAIT_MAX_SEC)
+            tg_send_message(f"[INFO] Esperando {wt}s antes de la siguiente ronda…")
+            time.sleep(wt)
 
 if __name__ == "__main__":
     main()
