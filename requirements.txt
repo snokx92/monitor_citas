@@ -1,6 +1,7 @@
-# --- Core ---
-requests>=2.31.0,<3
-# Playwright estable (evita la 1.44.1 que te marcó "no matching distribution")
-playwright>=1.44,<1.46
-# opcional (a veces mejora estabilidad de TLS/proxy)
-certifi>=2024.2.2
+playwright==1.44.1
+requests==2.31.0
+urllib3==2.0.7
+certifi==2024.7.4
+charset-normalizer==3.2.0
+idna==3.7
+typing-extensions==4.9.0
