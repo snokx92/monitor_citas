@@ -1,587 +1,492 @@
 # -*- coding: utf-8 -*-
-"""
-Monitor de citas – Monterrey + Ciudad de México
+# monitor_citas_multiconsulados.py
+#
+# Bot de monitoreo para citas (Bookitit / citaconsular.es)
+# - Telegram: envía alertas, capturas y HTML de evidencia
+# - Proxy residencial: toma PROXY_LIST (1+ proxies separados por coma)
+# - Muestra la IP pública usada en cada vuelta cuando SHOW_PUBLIC_IP=1
+# - CDMX: hace el click adicional en el panel de aviso
+#
+# ENV requeridas (Railway → Variables):
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+#
+# Opcionales:
+#   TELEGRAM_FILE_CHAT_ID (si no, usa TELEGRAM_CHAT_ID)
+#   PROXY_LIST="http://user:pass@host:port[, http://user:pass@host2:port2]"
+#   CHECK_INTERVAL_SEC=120        (default 120)
+#   PROOF_ON_NO_SLOTS=1           (envía HTML/captura si no hay huecos)
+#   DEBUG_STEPS=1                 (más logs y evidencias de cada paso)
+#   BLOCK_IMAGES=1                (1= no cargar imágenes, 0= sí cargar)
+#   SHOW_PUBLIC_IP=1              (imprime IP pública)
+#   IP_ENDPOINT="https://api.ipify.org?format=json"
+#   HUMAN_MIN=0.7  HUMAN_MAX=1.5  (pausas “humanas”)
+#   FORCE_TEST=1                  (envía mensaje de prueba al iniciar)
+#
+# Consulados configurados:
+#   Monterrey (flujo estándar)
+#   Ciudad de México (requiere click panel)
+#
+# Ejecutar local:
+#   pip install playwright requests
+#   playwright install --with-deps chromium
+#   python monitor_citas_multiconsulados.py
+#
+# Probe (una sola visita y evidencias):
+#   python monitor_citas_multiconsulados.py --probe "Ciudad de México"
 
-Lo que hace:
-- Revisa múltiples consulados (por env CONSUL_URLS).
-- Ciudad de México: hace el "click extra" sobre el panel antes de buscar el calendario.
-- Detección por:
-    * Horas HH:MM (regex) en página e iframes.
-    * Fallback por texto "Hueco libre" (aunque no haya HH:MM).
-    * Texto de "No hay horas disponibles".
-- Evidencia:
-    * PROOF_ON_NO_SLOTS=1 -> cuando no hay huecos, envía captura y HTML.
-    * NUEVO: si la página parece "vacía/bloqueo", SIEMPRE adjunta HTML + captura.
-    * --probe "Nombre" -> prueba guiada (1 vuelta) con video + capturas + HTML.
-- Anti-bloqueo:
-    * Si el HTML es muy corto o sin texto visible -> marca "blank" y adjunta evidencia.
-    * Opcionalmente rota proxy si defines PROXY_LIST (formato http://user:pass@host:port).
-- Emulación:
-    * CDMX emula iPhone Safari por defecto (CDMX_MOBILE=1).
-    * Monterrey usa desktop.
-
-Variables útiles (Railway -> Variables):
-TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-CHECK_INTERVAL_SEC (default 120)
-HUMAN_MIN (0.7) HUMAN_MAX (1.6)
-BLOCK_IMAGES (0/1) BLOCK_FONTS (1/0)
-DEBUG_STEPS (1/0)
-PROOF_ON_NO_SLOTS (1/0)
-CDMX_MOBILE (1/0)
-PROXY_LIST (separado por coma)
-RETRIES_ON_BLOCK (2 por defecto)
-
-CONSUL_URLS ejemplo (default ya trae MTY y CDMX):
-"Monterrey|https://.../25b18886db70f7ec9fd6dfd1a85d1395f/|default,
- Ciudad de Mexico|https://.../21b7c1aaf9fef2785deb64ccab5ceca06/|cdmx_panel"
-"""
-
-import os
-import sys
-import re
-import time
-import random
-import hashlib
-from typing import List, Tuple, Optional, Dict
+import os, sys, time, json, random, re, pathlib, urllib.parse
+from dataclasses import dataclass
+from typing import Optional, Tuple, List, Dict
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PTimeout
 
+# ------------------------ Config & helpers ------------------------
 
-# =========================
-# Entorno
-# =========================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+@dataclass
+class Cfg:
+    # URLs
+    URLS: Dict[str, Dict] = None
 
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "120"))
-HUMAN_MIN = float(os.getenv("HUMAN_MIN", "0.7"))
-HUMAN_MAX = float(os.getenv("HUMAN_MAX", "1.6"))
+    # Selectores / textos frecuentes
+    SELECTOR_CONTINUE: str = 'button.btn.btn-success, button:has-text("Continue"), button:has-text("Continuar")'
+    TEXT_NO_CITAS: str = "No hay horas disponibles"
+    BUTTON_CANDIDATES: str = "button, .btn, [role=button]"
+    DIA_REGEX: str = r"(Lunes|Martes|Miércoles|Jueves|Viernes|Sábado|Domingo).*?\b\d{4}\b"
 
-BLOCK_IMAGES = os.getenv("BLOCK_IMAGES", "0") == "1"
-BLOCK_FONTS  = os.getenv("BLOCK_FONTS", "1") == "1"
+    # Control
+    CHECK_INTERVAL_SEC: int = int(os.getenv("CHECK_INTERVAL_SEC", "120"))
+    PROOF_ON_NO_SLOTS: bool = os.getenv("PROOF_ON_NO_SLOTS", "0") == "1"
+    DEBUG_STEPS: bool = os.getenv("DEBUG_STEPS", "0") == "1"
+    BLOCK_IMAGES: bool = os.getenv("BLOCK_IMAGES", "1") == "1"
+    SHOW_PUBLIC_IP: bool = os.getenv("SHOW_PUBLIC_IP", "1") == "1"
+    IP_ENDPOINT: str = os.getenv("IP_ENDPOINT", "https://api.ipify.org?format=json")
 
-DEBUG_STEPS       = os.getenv("DEBUG_STEPS", "1") == "1"
-TRACE_PLAYWRIGHT  = os.getenv("TRACE_PLAYWRIGHT", "0") == "1"
-PROOF_ON_NO_SLOTS = os.getenv("PROOF_ON_NO_SLOTS", "1") == "1"
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    TELEGRAM_FILE_CHAT_ID: str = os.getenv("TELEGRAM_FILE_CHAT_ID", "")
 
-PROXY_LIST = [s.strip() for s in os.getenv("PROXY_LIST", "").split(",") if s.strip()]
-RETRIES_ON_BLOCK = int(os.getenv("RETRIES_ON_BLOCK", "2"))
-CDMX_MOBILE = os.getenv("CDMX_MOBILE", "1") == "1"
+    HUMAN_MIN: float = float(os.getenv("HUMAN_MIN", "0.7"))
+    HUMAN_MAX: float = float(os.getenv("HUMAN_MAX", "1.5"))
 
-DEFAULT_CONSUL_URLS = ",".join([
-    "Monterrey|https://www.citaconsular.es/es/hosteds/widgetdefault/25b18886db70f7ec9fd6dfd1a85d1395f/|default",
-    "Ciudad de Mexico|https://www.citaconsular.es/es/hosteds/widgetdefault/21b7c1aaf9fef2785deb64ccab5ceca06/|cdmx_panel",
-])
-CONSUL_URLS = os.getenv("CONSUL_URLS", DEFAULT_CONSUL_URLS)
+    PROXY_LIST_RAW: str = os.getenv("PROXY_LIST", "").strip()
 
-# =========================
-# Constantes/regex
-# =========================
-TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
-NO_CITAS_PATTERNS = [
-    "No hay horas disponibles",
-    "No hay citas disponibles",
-    "No hay disponibilidad",
-    "Inténtelo de nuevo dentro de unos días",
-]
+    def __post_init__(self):
+        if not self.URLS:
+            self.URLS = {
+                # Monterrey (flujo estándar)
+                "Monterrey": {
+                    "url": "https://www.citaconsular.es/es/hosteds/widgetdefault/25b18886db70f7ec9fd6dfd1a85d1395f/",
+                    "cdmx_panel": False,
+                    "mobile_like": False,
+                },
+                # Ciudad de México (click panel)
+                "Ciudad de México": {
+                    "url": "https://www.citaconsular.es/es/hosteds/widgetdefault/21b7c1aaf9fef2785deb64ccab5ceca06/",
+                    "cdmx_panel": True,
+                    "mobile_like": True,   # emular iPhone para mejorar score anti-bot
+                },
+            }
 
-USER_AGENTS_DESKTOP = [
+cfg = Cfg()
+
+CHAT_FILES = cfg.TELEGRAM_FILE_CHAT_ID or cfg.TELEGRAM_CHAT_ID
+
+UA_DESKTOPS = [
+    # Chrome / Edge / Firefox recientes
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4; rv:127.0) Gecko/20100101 Firefox/127.0",
 ]
-UA_IPHONE = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+UA_MOBILE = [
+    # iPhone Safari
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+]
 
-STEALTH_JS = """
-Object.defineProperty(navigator, 'webdriver', {get: () => false});
-Object.defineProperty(navigator, 'languages', {get: () => ['es-MX','es','en-US','en']});
-Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
-window.chrome = { runtime: {} };
-"""
+TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
 
-# =========================
-# Telegram helpers
-# =========================
-def notify(msg: str) -> None:
-    print(msg, flush=True)
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-                timeout=30,
-            )
-        except Exception as e:
-            print(f"[WARN] Telegram mensaje fallo: {e}", flush=True)
+# ------------------------ Telegram ------------------------
 
-def send_photo(path: str, caption: str = "") -> None:
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+def notify(text: str):
+    print(text, flush=True)
+    if not (cfg.TELEGRAM_BOT_TOKEN and cfg.TELEGRAM_CHAT_ID):
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{cfg.TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": text},
+            timeout=15
+        )
+    except Exception as e:
+        print(f"[WARN] Telegram sendMessage: {e}", flush=True)
+
+def send_photo(path: str, caption: str = ""):
+    if not (cfg.TELEGRAM_BOT_TOKEN and CHAT_FILES and pathlib.Path(path).exists()):
         return
     try:
         with open(path, "rb") as f:
             requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                f"https://api.telegram.org/bot{cfg.TELEGRAM_BOT_TOKEN}/sendPhoto",
+                data={"chat_id": CHAT_FILES, "caption": caption},
                 files={"photo": f},
-                timeout=60,
+                timeout=30
             )
     except Exception as e:
-        print(f"[WARN] Telegram photo fallo: {e}", flush=True)
+        print(f"[WARN] Telegram sendPhoto: {e}", flush=True)
 
-def send_document(path: str, caption: str = "") -> None:
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+def send_document(path: str, caption: str = ""):
+    if not (cfg.TELEGRAM_BOT_TOKEN and CHAT_FILES and pathlib.Path(path).exists()):
         return
     try:
         with open(path, "rb") as f:
             requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
-                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                f"https://api.telegram.org/bot{cfg.TELEGRAM_BOT_TOKEN}/sendDocument",
+                data={"chat_id": CHAT_FILES, "caption": caption},
                 files={"document": f},
-                timeout=60,
+                timeout=30
             )
     except Exception as e:
-        print(f"[WARN] Telegram doc fallo: {e}", flush=True)
+        print(f"[WARN] Telegram sendDocument: {e}", flush=True)
 
+# ------------------------ Proxy & IP ------------------------
 
-# =========================
-# Utilidades varias
-# =========================
-def human_pause():
-    time.sleep(random.uniform(HUMAN_MIN, HUMAN_MAX))
-
-def slugify(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", s.lower())
-
-def parse_consuls(env_string: str) -> List[Tuple[str,str,str]]:
-    out = []
-    for part in env_string.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            name, url, mode = [x.strip() for x in part.split("|", 2)]
-            out.append((name, url, mode))
-        except Exception:
-            pass
-    return out
-
-def is_blank_like(html: str, text: str) -> bool:
-    # Heurística conservadora: muy poco HTML o texto nulo
-    if not html:
-        return True
-    if len(html) < 1200 and len(text.strip()) < 30:
-        return True
-    # HTML de Bookitit mínimo suele superar este umbral
-    return False
-
-def has_no_citas_text(text: str) -> bool:
-    low = text.lower()
-    for pat in NO_CITAS_PATTERNS:
-        if pat.lower() in low:
-            return True
-    return False
-
-def extract_slots_from_html(html: str) -> List[str]:
-    slots = []
-    for m in TIME_RE.finditer(html or ""):
-        slots.append(m.group(0))
-    # Fallback por "Hueco libre" si no vemos HH:MM
-    if not slots and "hueco libre" in (html or "").lower():
-        slots.append("Hueco libre (sin hora)")
-    return sorted(set(slots))
-
-
-# =========================
-# Navegación Playwright
-# =========================
-def build_context(browser, name: str, mode: str, probe: bool = False):
-    # Desktop por defecto; CDMX puede ir móvil
-    use_mobile = (mode == "cdmx_panel" and CDMX_MOBILE)
-    if use_mobile:
-        user_agent = UA_IPHONE
-        viewport = {"width": 390, "height": 844}
-        device_scale = 3
-        is_mobile = True
-        has_touch = True
-    else:
-        user_agent = random.choice(USER_AGENTS_DESKTOP)
-        viewport = {"width": random.randint(1200,1440), "height": random.randint(800,960)}
-        device_scale = 1
-        is_mobile = False
-        has_touch = False
-
-    ctx = browser.new_context(
-        user_agent=user_agent,
-        viewport=viewport,
-        device_scale_factor=device_scale,
-        is_mobile=is_mobile,
-        has_touch=has_touch,
-        locale="es-ES",
-        accept_downloads=False,
-        record_video_dir="/tmp/vid" if probe else None,
-    )
-
-    # Stealth
+def parse_proxy(url: str) -> Optional[dict]:
+    """Convierte una URL de proxy en dict para Playwright: {'server', 'username', 'password'}."""
     try:
-        ctx.add_init_script(STEALTH_JS)
-    except Exception:
-        pass
-
-    # Bloqueo selectivo de recursos para ahorrar (opcional)
-    if BLOCK_IMAGES or BLOCK_FONTS:
-        def _route(route):
-            req = route.request
-            rtype = req.resource_type
-            url = req.url
-            if BLOCK_IMAGES and rtype in ("image", "media"):
-                return route.abort()
-            if BLOCK_FONTS and (rtype == "font" or url.endswith(".woff") or url.endswith(".woff2")):
-                return route.abort()
-            return route.continue_()
-        try:
-            ctx.route("**/*", _route)
-        except Exception:
-            pass
-
-    return ctx
-
-def attach_dialog_autoaccept(page):
-    def _on_dialog(d):
-        try:
-            d.accept()
-        except Exception:
-            pass
-    page.on("dialog", _on_dialog)
-
-def click_extra_cdmx(page) -> None:
-    """CDMX: un solo click en el panel de texto para desplegar el calendario."""
-    # Intentamos click por selectores razonables; fallback: click al centro.
-    tried = False
-    locators = [
-        "text=PRESENTACION DOCUMENTACION LEY MEMORIA DEMOCRATICA",
-        "div.panel-body",
-        "div.panel",
-        "div.container",
-    ]
-    for sel in locators:
-        try:
-            page.locator(sel).first.click(timeout=2000)
-            tried = True
-            break
-        except Exception:
-            continue
-    if not tried:
-        try:
-            box = page.viewport_size
-            x = (box["width"] // 2) if box else 300
-            y = (box["height"] // 3) if box else 300
-            page.mouse.click(x, y)
-        except Exception:
-            pass
-    human_pause()
-
-def page_main_text(page) -> str:
-    try:
-        return (page.inner_text("body") or "").strip()
-    except Exception:
-        try:
-            return (page.content() or "")
-        except Exception:
-            return ""
-
-def collect_iframe_htmls(page) -> List[str]:
-    htmls = []
-    try:
-        for fr in page.frames:
-            try:
-                c = fr.content() or ""
-                htmls.append(c)
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return htmls
-
-def take_best_screenshot(page, slug: str, tag: str) -> Optional[str]:
-    png_path = f"/tmp/{slug}_{tag}.png"
-    # Intentar del iframe más "grande" (por longitud de HTML); si no, de toda la página.
-    best = None
-    best_len = -1
-    try:
-        for fr in page.frames:
-            try:
-                c = fr.content() or ""
-                if len(c) > best_len and fr != page.main_frame:
-                    best = fr
-                    best_len = len(c)
-            except Exception:
-                continue
-    except Exception:
-        best = None
-
-    try:
-        if best:
-            try:
-                best.page.screenshot(path=png_path, full_page=True)
-            except Exception:
-                page.screenshot(path=png_path, full_page=True)
-        else:
-            page.screenshot(path=png_path, full_page=True)
-        return png_path
+        u = urllib.parse.urlparse(url.strip())
+        if not u.scheme or not u.hostname or not u.port:
+            return None
+        pw = None
+        user = None
+        if u.username:
+            user = urllib.parse.unquote(u.username)
+        if u.password:
+            pw = urllib.parse.unquote(u.password)
+        return {
+            "server": f"{u.scheme}://{u.hostname}:{u.port}",
+            "username": user,
+            "password": pw
+        }
     except Exception:
         return None
 
+def pick_proxy() -> Tuple[Optional[dict], Optional[str]]:
+    """Elige un proxy de PROXY_LIST (al azar) y devuelve (dict_playwright, url_plain)."""
+    if not cfg.PROXY_LIST_RAW:
+        return None, None
+    options = [p.strip() for p in cfg.PROXY_LIST_RAW.split(",") if p.strip()]
+    if not options:
+        return None, None
+    chosen = random.choice(options)
+    pd = parse_proxy(chosen)
+    return pd, chosen
 
-# =========================
-# Revisión de un consulado
-# =========================
-def revisar_consulado(p, name: str, url: str, mode: str, probe: bool = False) -> Tuple[bool, List[str]]:
+def get_public_ip(proxy_url: Optional[str]) -> Optional[str]:
+    """Obtiene IP pública usando la misma ruta (con o sin proxy)."""
+    try:
+        kw = {}
+        if proxy_url:
+            kw["proxies"] = {"http": proxy_url, "https": proxy_url}
+        r = requests.get(cfg.IP_ENDPOINT, timeout=10, **kw)
+        if r.ok:
+            j = r.json() if r.headers.get("content-type","").startswith("application/json") else {"ip": r.text.strip()}
+            return j.get("ip")
+    except Exception as e:
+        print(f"[WARN] get_public_ip: {e}", flush=True)
+    return None
+
+# ------------------------ Utils ------------------------
+
+def human_pause():
+    time.sleep(random.uniform(cfg.HUMAN_MIN, cfg.HUMAN_MAX))
+
+def now_stamp():
+    return time.strftime("%Y-%m-%d_%H-%M-%S")
+
+def slug(s: str) -> str:
+    return re.sub(r"[^a-z0-9_-]+", "_", s.lower())
+
+def find_date_text(page) -> Optional[str]:
+    try:
+        content = (page.content() or "").strip()
+    except Exception:
+        return None
+    m = re.search(cfg.DIA_REGEX, content, re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(0)
+    return None
+
+def extract_real_slots(page) -> List[Tuple[str, str]]:
+    slots = []
+    try:
+        candidates = page.locator(cfg.BUTTON_CANDIDATES)
+        count = candidates.count()
+    except Exception:
+        count = 0
+    for i in range(min(count, 400)):
+        try:
+            el = candidates.nth(i)
+            if not el.is_visible():
+                continue
+            text = el.inner_text().strip()
+            if not text:
+                continue
+            if "hueco libre" not in text.lower():
+                continue
+            m = TIME_RE.search(text)
+            if m:
+                slots.append((m.group(0), text))
+        except Exception:
+            continue
+    return slots
+
+# ------------------------ Core visit ------------------------
+
+def revisar_una_vez(nombre: str, url: str, cdmx_panel: bool, mobile_like: bool,
+                    p, browser, debug_prefix: str, proxy_url: Optional[str]) -> Tuple[bool, List[Tuple[str,str]], Optional[str], bool, int]:
     """
-    Devuelve (hay_huecos, lista_horas_o_labels)
-    En cualquier caso puede adjuntar evidencia según flags.
+    Devuelve: (ok_slots, slots, fecha, blank_html, html_len)
     """
-    slug = slugify(name)
+    # Contexto
+    ua = random.choice(UA_MOBILE if mobile_like else UA_DESKTOPS)
+    vw = random.randint(1200, 1440)
+    vh = random.randint(800, 960)
 
-    # Proxy simple (opcional): escogemos uno si lo hay
-    proxy_arg = None
-    if PROXY_LIST:
-        proxy_arg = random.choice(PROXY_LIST)
+    ctx_args = dict(
+        viewport={"width": vw, "height": vh},
+        user_agent=ua,
+        locale="es-ES",
+        extra_http_headers={"Accept-Language": "es-MX,es;q=0.9,en;q=0.8"},
+    )
+    if cfg.BLOCK_IMAGES:
+        ctx_args["permissions"] = []
+        ctx_args["bypass_csp"] = True
 
-    # Lanzar Chromium
-    launch_args = {
-        "headless": True,
-        "args": [
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-        ],
-        "timeout": 120000,
-    }
-    if proxy_arg:
-        launch_args["proxy"] = {"server": proxy_arg}
-
-    browser = p.chromium.launch(**launch_args)
-    ctx = build_context(browser, name, mode, probe=probe)
-    page = ctx.new_page()
-    attach_dialog_autoaccept(page)
+    context = browser.new_context(**ctx_args)
+    page = context.new_page()
     page.set_default_timeout(20000)
 
-    if DEBUG_STEPS:
-        print(f"[{name}] goto…", flush=True)
-
-    try:
-        page.goto(url, wait_until="domcontentloaded")
-    except Exception:
-        pass
-    human_pause()
-
-    # CDMX: click extra sobre panel
-    if mode == "cdmx_panel":
-        if DEBUG_STEPS:
-            print(f"[{name}] CDMX: click panel…", flush=True)
-        click_extra_cdmx(page)
-
-    # Heurística de "página vacía"
-    html = page.content() or ""
-    txt = page_main_text(page)
-    if is_blank_like(html, txt):
-        # Reintentos suaves locales
-        blank_confirmed = False
-        for _ in range(RETRIES_ON_BLOCK):
-            human_pause()
-            try:
-                page.reload(wait_until="domcontentloaded")
-            except Exception:
-                pass
-            human_pause()
-            html = page.content() or ""
-            txt = page_main_text(page)
-            if not is_blank_like(html, txt):
-                blank_confirmed = False
-                break
-            blank_confirmed = True
-
-        if blank_confirmed:
-            # Evidencia de blank: SIEMPRE HTML + captura
-            notify(f"⚠ {name}: página vacía tras reintentos (bloqueo probable).")
-            try:
-                html_path = f"/tmp/{slug}_blank.html"
-                with open(html_path, "w", encoding="utf-8") as f:
-                    f.write(html)
-                send_document(html_path, caption=f"{name}: HTML en blanco (posible bloqueo)")
-            except Exception as e:
-                print(f"[WARN] No se pudo guardar/enviar HTML blank: {e}", flush=True)
-
-            try:
-                snap = take_best_screenshot(page, slug, "blank")
-                if snap:
-                    send_photo(snap, caption=f"{name}: captura en blanco (posible bloqueo)")
-            except Exception as e:
-                print(f"[WARN] No se pudo capturar/enviar screenshot blank: {e}", flush=True)
-
-            try:
-                ctx.close()
-                browser.close()
-            except Exception:
-                pass
-            return (False, [])
-
-    # Buscar texto de "no hay"
-    text_lower = (txt or "").lower()
-    any_no = has_no_citas_text(txt)
-
-    # Extraer HH:MM en principal e iframes
-    slots = extract_slots_from_html(html)
-    for sub in collect_iframe_htmls(page):
-        slots += extract_slots_from_html(sub)
-    slots = sorted(set(slots))
-
-    # Evidencia cuando no hay huecos (si se pidió)
-    if PROOF_ON_NO_SLOTS and not slots:
+    # Bloqueo de imágenes si así lo definen (request interception simple)
+    if cfg.BLOCK_IMAGES:
         try:
-            html_path = f"/tmp/{slug}_no_slots.html"
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(html)
-            send_document(html_path, caption=f"{name}: HTML sin huecos")
-        except Exception as e:
-            print(f"[WARN] No se pudo adjuntar HTML sin huecos: {e}", flush=True)
-        try:
-            snap = take_best_screenshot(page, slug, "no_slots")
-            if snap:
-                send_photo(snap, caption=f"{name}: captura sin huecos")
-        except Exception as e:
-            print(f"[WARN] No se pudo adjuntar screenshot sin huecos: {e}", flush=True)
-
-    # Cierre
-    try:
-        ctx.close()
-        browser.close()
-    except Exception:
-        pass
-
-    if slots:
-        return (True, slots)
-    else:
-        return (False, [])
-
-
-# =========================
-# Probe (una vuelta con video)
-# =========================
-def run_probe(which: str):
-    cons = parse_consuls(CONSUL_URLS)
-    target = None
-    for c in cons:
-        if c[0].lower() == which.lower():
-            target = c
-            break
-    if not target:
-        print(f"[probe] No se encontró consulado: {which}", flush=True)
-        return
-
-    name, url, mode = target
-    slug = slugify(name)
-
-    with sync_playwright() as p:
-        # Video activo en probe: record_video_dir se configura en build_context
-        launch_args = {
-            "headless": True,
-            "args": [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-            "timeout": 120000,
-        }
-        browser = p.chromium.launch(**launch_args)
-        ctx = build_context(browser, name, mode, probe=True)
-        page = ctx.new_page()
-        attach_dialog_autoaccept(page)
-        page.set_default_timeout(20000)
-
-        print(f"[probe:{name}] goto…", flush=True)
-        page.goto(url, wait_until="domcontentloaded")
-        human_pause()
-        if mode == "cdmx_panel":
-            print(f"[probe:{name}] click panel…", flush=True)
-            click_extra_cdmx(page)
-            human_pause()
-
-        # Capturas + HTML
-        try:
-            html_path = f"/tmp/{slug}_probe.html"
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(page.content() or "")
-            send_document(html_path, caption=f"{name} (probe): HTML")
-        except Exception as e:
-            print(f"[probe] no se pudo enviar HTML: {e}", flush=True)
-
-        try:
-            shot = take_best_screenshot(page, slug, "probe")
-            if shot:
-                send_photo(shot, caption=f"{name} (probe): captura")
-        except Exception as e:
-            print(f"[probe] no se pudo enviar captura: {e}", flush=True)
-
-        try:
-            ctx.close()
-            browser.close()
+            page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
         except Exception:
             pass
 
-        notify(f"[probe] {name} terminado.")
+    # Primer aviso JS alert — aceptar automáticamente
+    def on_dialog(dialog):
+        try:
+            dialog.accept()
+        except Exception:
+            pass
+    context.on("dialog", on_dialog)
 
+    # Navegar
+    if cfg.DEBUG_STEPS:
+        print(f"[{nombre}] goto…", flush=True)
+    page.goto(url, wait_until="domcontentloaded")
+    human_pause()
 
-# =========================
-# Bucle principal
-# =========================
-def main_loop():
-    cons = parse_consuls(CONSUL_URLS)
-    names = ", ".join([c[0] for c in cons])
-    notify(f"[INFO] Consulados: {names}")
+    # Botón Continue si existe (flujo estándar)
+    try:
+        page.wait_for_selector(cfg.SELECTOR_CONTINUE, timeout=7000)
+        page.click(cfg.SELECTOR_CONTINUE, force=True)
+        human_pause()
+    except PTimeout:
+        pass
 
-    while True:
-        start = time.strftime("%Y-%m-%d %H:%M:%S")
-        for name, url, mode in cons:
+    # Para CDMX – click en panel grande de aviso
+    if cdmx_panel:
+        if cfg.DEBUG_STEPS:
+            print(f"[{nombre}] CDMX: click panel…", flush=True)
+        clicked = False
+        # 1) Por texto visible
+        try:
+            panel = page.get_by_text("PRESENTACION DOCUMENTACION", exact=False)
+            panel.first.click(timeout=4000)
+            clicked = True
+            human_pause()
+        except Exception:
+            pass
+        # 2) Fallback: click en panel/container grande
+        if not clicked:
             try:
-                with sync_playwright() as p:
-                    ok, slots = revisar_consulado(p, name, url, mode, probe=False)
-                if ok and slots:
-                    primeras = ", ".join(sorted(slots)[:5])
-                    notify(f"[{start}] {name} -> HAY HUECOS: {primeras}  |  {url}")
-                    # Respiro para que te dé tiempo de entrar
-                    time.sleep(300)
-                else:
-                    notify(f"[{start}] {name} -> sin huecos por ahora.")
+                page.click("css=.panel, .panel-body, .container, .content, .box", timeout=3000)
+                clicked = True
+                human_pause()
+            except Exception:
+                pass
+
+    # ¿Mensaje “No hay horas disponibles”?
+    try:
+        page.get_by_text(cfg.TEXT_NO_CITAS, exact=False).wait_for(timeout=3000)
+        fecha = find_date_text(page)
+        # Evidencia si corresponde
+        if cfg.PROOF_ON_NO_SLOTS or cfg.DEBUG_STEPS:
+            save_evidencias(nombre, page, debug_prefix, "no_slots")
+        context.close()
+        return (False, [], fecha, False, 0)
+    except PTimeout:
+        pass
+
+    # Capturar HTML para comprobar “blanco”
+    html = ""
+    try:
+        html = page.content() or ""
+    except Exception:
+        html = ""
+    html_len = len(html.strip())
+    blank = html_len < 120  # umbral bajo; típico "en blanco" ~39B
+
+    # Buscar huecos
+    slots = extract_real_slots(page)
+    fecha = find_date_text(page)
+
+    # Evidencias: si hay huecos, siempre; si no, según flags
+    need_proof = bool(slots) or cfg.PROOF_ON_NO_SLOTS or cfg.DEBUG_STEPS or blank
+    if need_proof:
+        save_evidencias(nombre, page, debug_prefix, "slots" if slots else ("blank" if blank else "page"))
+
+    context.close()
+    return (bool(slots), slots, fecha, blank, html_len)
+
+def save_evidencias(nombre: str, page, prefix: str, tag: str):
+    """Guarda y envía HTML + captura."""
+    stamp = now_stamp()
+    base = f"/tmp/{prefix}_{slug(nombre)}_{tag}_{stamp}"
+    html_path = base + ".html"
+    png_path = base + ".png"
+
+    # HTML
+    try:
+        content = page.content() or ""
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        send_document(html_path, caption=f"{nombre}: HTML ({tag})")
+    except Exception as e:
+        print(f"[WARN] save_evidencias(html): {e}", flush=True)
+
+    # PNG
+    try:
+        page.screenshot(path=png_path, full_page=True)
+        send_photo(png_path, caption=f"{nombre}: captura ({tag})")
+    except Exception as e:
+        print(f"[WARN] save_evidencias(png): {e}", flush=True)
+
+# ------------------------ Main loop ------------------------
+
+def main_loop():
+    # Msg de prueba
+    if os.getenv("FORCE_TEST") == "1":
+        notify("🚀 Test OK: el bot está listo y puede enviarte evidencias e IP.")
+        time.sleep(3)
+
+    # Proxy
+    pw_proxy, raw_proxy = pick_proxy()
+    proxy_info = pw_proxy["server"] if pw_proxy else "SIN PROXY"
+    print(f"[INFO] Proxy: {proxy_info}", flush=True)
+
+    # IP pública
+    if cfg.SHOW_PUBLIC_IP:
+        ip = get_public_ip(raw_proxy)
+        if ip:
+            print(f"[INFO] IP pública: {ip}", flush=True)
+        else:
+            print("[INFO] IP pública: (no disponible)", flush=True)
+
+    # Playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            proxy=pw_proxy if pw_proxy else None,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+        )
+
+        while True:
+            try:
+                for nombre, meta in cfg.URLS.items():
+                    url = meta["url"]
+                    cdmx_panel = bool(meta.get("cdmx_panel"))
+                    mobile_like = bool(meta.get("mobile_like"))
+
+                    prefix = "debug" if cfg.DEBUG_STEPS else "proof" if cfg.PROOF_ON_NO_SLOTS else "run"
+
+                    ok, slots, fecha, blank, html_len = revisar_una_vez(
+                        nombre, url, cdmx_panel, mobile_like, p, browser, prefix, raw_proxy
+                    )
+
+                    if blank:
+                        notify(f"⚠️ {nombre}: página vacía tras reintentos (bloqueo probable). [html_len={html_len}]")
+
+                    if ok and slots:
+                        primeras = ", ".join(sorted({h for h, _ in slots})[:5])
+                        suf = f" ({fecha})" if fecha else ""
+                        notify(f"✅ ¡HAY HUECOS! {nombre}{suf} → Horas: {primeras}\nEntra ya: {url}")
+                        # Espera anti-doble notificación
+                        time.sleep(300)
+                    else:
+                        marca = time.strftime("%Y-%m-%d %H:%M:%S")
+                        notify(f"[{marca}] {nombre} -> sin huecos por ahora.")
+
+                # Espera “humana” entre rondas
+                wait_min = max(60, cfg.CHECK_INTERVAL_SEC - 20)
+                wait_max = cfg.CHECK_INTERVAL_SEC + 40
+                espera = random.randint(wait_min, wait_max)
+                print(f"[INFO] Esperando {espera}s antes de la siguiente ronda…", flush=True)
+                time.sleep(espera)
+
             except Exception as e:
-                print(f"[ERROR] {name}: {e}", flush=True)
-                time.sleep(60)
+                print(f"[ERROR] loop: {e}", flush=True)
+                time.sleep(90)
 
-        # Espera aleatoria humana
-        min_wait = max(30, CHECK_INTERVAL_SEC - 20)
-        max_wait = CHECK_INTERVAL_SEC + 40
-        wait_time = random.randint(min_wait, max_wait)
-        print(f"[INFO] Esperando {wait_time}s antes de la siguiente ronda…", flush=True)
-        time.sleep(wait_time)
+        # browser.close()  # (no se alcanza)
 
+# ------------------------ Probe ------------------------
+
+def run_probe(target_name: str):
+    pw_proxy, raw_proxy = pick_proxy()
+    proxy_info = pw_proxy["server"] if pw_proxy else "SIN PROXY"
+    print(f"[probe] Proxy: {proxy_info}", flush=True)
+    if cfg.SHOW_PUBLIC_IP:
+        ip = get_public_ip(raw_proxy)
+        print(f"[probe] IP pública: {ip}", flush=True)
+
+    meta = cfg.URLS.get(target_name)
+    if not meta:
+        print(f"[probe] Desconocido: {target_name}", flush=True)
+        return
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            proxy=pw_proxy if pw_proxy else None,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+        )
+        ok, slots, fecha, blank, html_len = revisar_una_vez(
+            target_name, meta["url"], bool(meta.get("cdmx_panel")), bool(meta.get("mobile_like")),
+            p, browser, "probe", raw_proxy
+        )
+        print(f"[probe] {target_name}: ok={ok}, slots={slots}, fecha={fecha}, blank={blank}, html_len={html_len}", flush=True)
+        browser.close()
+
+# ------------------------ Entrypoint ------------------------
+
+def parse_args():
+    # Muy simple: --probe "<nombre exacto>"
+    if len(sys.argv) >= 3 and sys.argv[1] == "--probe":
+        return ("probe", sys.argv[2])
+    return ("run", "")
 
 if __name__ == "__main__":
-    # Modo prueba puntual:
-    #   python monitor_citas_multiconsulados.py --probe "Ciudad de Mexico"
-    if "--probe" in sys.argv:
-        try:
-            idx = sys.argv.index("--probe") + 1
-            target = sys.argv[idx]
-        except Exception:
-            print("Uso: --probe \"Nombre del consulado\"", flush=True)
-            sys.exit(1)
-        run_probe(target)
-        sys.exit(0)
-
-    # Arranque normal
+    mode, param = parse_args()
     print("[start] Launching bot…", flush=True)
-    try:
+    print(f"[INFO] Config: proof={'ON' if cfg.PROOF_ON_NO_SLOTS else 'OFF'} "
+          f"debug={'ON' if cfg.DEBUG_STEPS else 'OFF'} "
+          f"block_images={'ON' if cfg.BLOCK_IMAGES else 'OFF'}", flush=True)
+    if mode == "probe":
+        run_probe(param)
+    else:
+        names = ", ".join(cfg.URLS.keys())
+        print(f"[INFO] Consulados: {names}", flush=True)
         main_loop()
-    except KeyboardInterrupt:
-        print("Bye.", flush=True)
