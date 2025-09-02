@@ -1,19 +1,15 @@
 #!/bin/bash
 set -e
 
-echo "[start] Upgrading pip/setuptools/wheel…"
-python -m pip install --upgrade pip setuptools wheel
-
-echo "[start] Installing requirements…"
-pip install -r requirements.txt
-
-echo "[start] Installing Playwright Chromium + system deps…"
-# Intento 1: todo junto
-python -m playwright install --with-deps chromium || (
-  echo "[start] Fallback: install-deps + chromium separately…"
+echo "[start.sh] Installing Playwright browsers (Chromium) + system deps…"
+# Intento con --with-deps (nuevas versiones)
+if python -m playwright install --with-deps chromium; then
+  echo "[start.sh] Playwright Chromium installed with system deps (new flag)."
+else
+  echo "[start.sh] '--with-deps' not supported here; trying legacy sequence…"
   python -m playwright install-deps chromium || true
   python -m playwright install chromium
-)
+fi
 
-echo "[start] Launching bot…"
+echo "[start.sh] Launching bot…"
 python monitor_citas_multiconsulados.py
