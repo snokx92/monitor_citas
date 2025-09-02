@@ -1,5 +1,6 @@
-pip>=24.0
-setuptools>=70
-wheel>=0.42
-requests>=2.31,<3
-playwright==1.47.0
+# --- Core ---
+requests>=2.31.0,<3
+# Playwright estable (evita la 1.44.1 que te marcó "no matching distribution")
+playwright>=1.44,<1.46
+# opcional (a veces mejora estabilidad de TLS/proxy)
+certifi>=2024.2.2
