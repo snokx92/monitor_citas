@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, io, re, time, random, textwrap
+import os, io, re, time, random
 from datetime import datetime
 import requests
 
 # ===== JPG helper (opcional) =====
 try:
-    from PIL import Image                      # pip install pillow
+    from PIL import Image, ImageStat           # pip install pillow
     PIL_OK = True
 except Exception:
     PIL_OK = False
@@ -43,6 +43,18 @@ BTN_CONTINUE   = r'text=/Continue\s*\/\s*Continuar/i'
 NO_SLOTS_TEXT  = r'text=/No hay horas disponibles/i'
 PANEL_HEADER   = r'text=/PRESENTACION DOCUMENTACION/i'  # ambos consulados
 
+# Spinners/overlays comunes
+SPINNER_PATTERNS = [
+    r"text=/Checking Your Browser/i",
+    r"text=/Please wait.*redirected/i",
+    r"text=/Cargando|Loading|Espere|Espere un momento/i",
+    "css=.loading, .spinner, .lds-ring, .lds-roller, .loader, .sk-fading-circle, .pace, .pace-activity",
+    "css=[aria-busy=true], [data-loading=true]",
+    "css=img[alt*=loading i], svg[aria-label*=loading i]"
+]
+# Heurística: iframes/URLs habituales del widget
+WIDGET_IFRAME_PATTERNS = [r"bookitit", r"citaconsular"]
+
 # ==========================
 # Telegram helpers
 # ==========================
@@ -71,8 +83,53 @@ def tele_send_doc(bytes_, filename, caption=""):
     except Exception:
         pass
 
+# ======= Captura inteligente (anti-blanco) =======
+def _is_visual_blank(png_bytes: bytes) -> bool:
+    if not PIL_OK:
+        return False  # sin PIL no podemos validar; dejamos pasar
+    try:
+        img = Image.open(io.BytesIO(png_bytes)).convert("L")  # escala de grises
+        stat = ImageStat.Stat(img)
+        # heurísticas: varianza muy baja -> imagen plana; media muy alta -> casi blanca
+        variance = (stat.var[0] if isinstance(stat.var, list) else stat.var)
+        mean = (stat.mean[0] if isinstance(stat.mean, list) else stat.mean)
+        if variance < 25 and mean > 235:   # muy uniforme y claro
+            return True
+        # % de píxeles muy claros
+        w, h = img.size
+        if w*h == 0:
+            return True
+        bright = sum(1 for p in img.getdata() if p >= 245)
+        if bright / float(w*h) > 0.985:    # >98.5% clarísimo
+            return True
+    except Exception:
+        return False
+    return False
+
+def smart_screenshot(page, full=True, max_wait_ms=12000):
+    """Espera estabilidad y reintenta la captura si resulta 'blanca'."""
+    end = time.time() + max_wait_ms/1000.0
+    last_err = None
+    while time.time() < end:
+        try:
+            wait_for_stable_render(page, max_wait_ms=4000)
+            png = page.screenshot(full_page=full)
+            if not _is_visual_blank(png):
+                return png
+            time.sleep(0.35)
+        except Exception as e:
+            last_err = e
+            time.sleep(0.35)
+    # último intento
+    try:
+        return page.screenshot(full_page=full)
+    except Exception:
+        if last_err:
+            raise last_err
+        raise
+
 def tele_send_jpg(page, caption: str, quality: int = 82, full=True):
-    png = page.screenshot(full_page=full)
+    png = smart_screenshot(page, full=full, max_wait_ms=min(15000, WIDGET_TIMEOUT_MS))
     if not PIL_OK:
         tele_send_doc(png, "capture.png", caption)
         return
@@ -86,6 +143,7 @@ def tele_send_jpg(page, caption: str, quality: int = 82, full=True):
 
 def tele_send_html(page, name, caption):
     try:
+        wait_for_stable_render(page, max_wait_ms=min(15000, WIDGET_TIMEOUT_MS))
         html = page.content().encode("utf-8", "ignore")
         tele_send_doc(html, f"{name}.html", caption)
     except Exception:
@@ -134,21 +192,93 @@ def scroll_full(page):
     except Exception:
         pass
 
-def find_in_frames(page, patterns, timeout_ms) -> bool:
-    end = time.time() + timeout_ms/1000.0
-    while time.time() < end:
-        for pat in patterns:
-            try:
-                if page.locator(pat).first.is_visible(): return True
-            except Exception: pass
+def _any_visible(loc):
+    try:
+        return loc.first.is_visible()
+    except Exception:
+        return False
+
+def _find_any(page, patterns):
+    # página
+    for pat in patterns:
         try:
-            for fr in page.frames:
-                for pat in patterns:
-                    try:
-                        if fr.locator(pat).first.is_visible(): return True
-                    except Exception: pass
-        except Exception: pass
-        human_pause(0.35,0.6)
+            if _any_visible(page.locator(pat)):
+                return True
+        except Exception:
+            pass
+    # iframes
+    try:
+        for fr in page.frames:
+            for pat in patterns:
+                try:
+                    if _any_visible(fr.locator(pat)):
+                        return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False
+
+def _find_widget_iframe(page):
+    try:
+        for fr in page.frames:
+            url = (fr.url or "").lower()
+            for pat in WIDGET_IFRAME_PATTERNS:
+                if re.search(pat, url, re.I):
+                    return fr
+    except Exception:
+        pass
+    return None
+
+def _textlen(page_or_frame):
+    try:
+        txt = page_or_frame.evaluate("() => document.body && document.body.innerText || ''")
+        return len(txt or "")
+    except Exception:
+        return 0
+
+def wait_for_stable_render(page, max_wait_ms=15000, stable_cycles=3, poll_ms=300):
+    """
+    Espera a que:
+      1) No haya spinners/overlays comunes visibles en página e iframes
+      2) El DOM esté "estable": el length del innerText no varíe mucho durante varios ciclos
+      3) Si hay iframe del widget, que sea visible y sin spinner
+      4) Haya algo de texto (> 80 chars) para evitar páginas "vacías"
+    """
+    end = time.time() + max_wait_ms/1000.0
+    last_len = _textlen(page)
+    stable = 0
+
+    while time.time() < end:
+        # 1) Nada de spinners
+        if _find_any(page, SPINNER_PATTERNS):
+            stable = 0
+            time.sleep(poll_ms/1000.0); continue
+
+        # 3) Iframe del widget listo
+        fr = _find_widget_iframe(page)
+        if fr and (_find_any(fr, SPINNER_PATTERNS)):
+            stable = 0
+            time.sleep(poll_ms/1000.0); continue
+
+        # 4) Algo de texto
+        ln = _textlen(page)
+        if ln < 80:
+            stable = 0
+            time.sleep(poll_ms/1000.0); continue
+
+        # 2) DOM relativamente estable
+        if abs(ln - last_len) <= 20:
+            stable += 1
+        else:
+            stable = 0
+        last_len = ln
+
+        if stable >= stable_cycles:
+            return True
+
+        time.sleep(poll_ms/1000.0)
+
     return False
 
 def click_if_exists(page, selector) -> bool:
@@ -184,14 +314,6 @@ def get_citaconsular_href(page) -> str:
     return ""
 
 def goto_ministry_and_open_widget(context, min_url: str, cons_name: str):
-    """
-    Abre el Ministerio y hace el salto al widget:
-      - intenta click por texto
-      - intenta detectar popup con expect_popup
-      - si no hay popup, toma el href y hace page.goto(href)
-      - último recurso: click por JS + href
-    Devuelve la page ya posicionada en el widget (nueva o la misma).
-    """
     page = context.new_page()
     page.set_default_timeout(LANDING_TIMEOUT_MS)
 
@@ -203,6 +325,7 @@ def goto_ministry_and_open_widget(context, min_url: str, cons_name: str):
     page.goto(min_url, wait_until="domcontentloaded", timeout=LANDING_TIMEOUT_MS)
     safe_wait(page, "networkidle", LANDING_TIMEOUT_MS)
     close_overlays(page)
+    wait_for_stable_render(page, max_wait_ms=8000)
 
     if PROOF:
         tele_send_html(page, f"{cons_name.lower()}_ministerio", f"{cons_name}: HTML inicial (ministerio)")
@@ -229,9 +352,9 @@ def goto_ministry_and_open_widget(context, min_url: str, cons_name: str):
     if not link:
         href = get_citaconsular_href(page)
         if href:
-            # ir directo
             page.goto(href, wait_until="domcontentloaded", timeout=LANDING_TIMEOUT_MS)
             safe_wait(page, "networkidle", LANDING_TIMEOUT_MS)
+            wait_for_stable_render(page, max_wait_ms=12000)
             return page
 
     # Tenemos un locator clickable → intentar popup
@@ -244,6 +367,7 @@ def goto_ministry_and_open_widget(context, min_url: str, cons_name: str):
             new_page = p.value
             safe_wait(new_page, "domcontentloaded", LANDING_TIMEOUT_MS)
             safe_wait(new_page, "networkidle", LANDING_TIMEOUT_MS)
+            wait_for_stable_render(new_page, max_wait_ms=12000)
             return new_page
         except Exception:
             # Sin popup: ir por href
@@ -252,25 +376,25 @@ def goto_ministry_and_open_widget(context, min_url: str, cons_name: str):
                 if href:
                     page.goto(href, wait_until="domcontentloaded", timeout=LANDING_TIMEOUT_MS)
                     safe_wait(page, "networkidle", LANDING_TIMEOUT_MS)
+                    wait_for_stable_render(page, max_wait_ms=12000)
                     return page
             except Exception:
                 pass
-            # Último recurso: click por JS y si no, href global
+            # Último recurso
             try:
                 page.evaluate("(el)=>el.click()", link.element_handle())
-                # pequeño chance a popup
                 time.sleep(1.0)
-                # si no cambió, usar href global
                 href2 = get_citaconsular_href(page)
                 if href2:
                     page.goto(href2, wait_until="domcontentloaded", timeout=LANDING_TIMEOUT_MS)
                     safe_wait(page, "networkidle", LANDING_TIMEOUT_MS)
+                    wait_for_stable_render(page, max_wait_ms=12000)
                     return page
             except Exception:
                 pass
 
-    # si llegamos aquí, no pudimos saltar
-    return page  # devolver ministerio (para evidenciar y fallar con timeout luego)
+    # si llegamos aquí, no pudimos saltar; devolver ministerio
+    return page
 
 # ==========================
 # Widget helpers
@@ -285,6 +409,7 @@ def wait_widget_ready(page, entry_fallback=None) -> bool:
             page.goto(entry_fallback, wait_until="domcontentloaded", timeout=LANDING_TIMEOUT_MS)
             safe_wait(page, "networkidle", LANDING_TIMEOUT_MS)
             close_overlays(page)
+            wait_for_stable_render(page, max_wait_ms=8000)
         except Exception:
             pass
         return _wait_widget_once(page, patterns, WIDGET_TIMEOUT_MS)
@@ -294,17 +419,20 @@ def _wait_widget_once(page, patterns, timeout_ms) -> bool:
     end = time.time() + timeout_ms/1000.0
     while time.time() < end:
         close_overlays(page)
-        scroll_full(page)
-        if find_in_frames(page, patterns, 1200):
+        fr = _find_widget_iframe(page)
+        # si hay iframe del widget y no hay spinners, buscar señales dentro
+        if fr and not _find_any(page, SPINNER_PATTERNS) and not _find_any(fr, SPINNER_PATTERNS):
+            if _find_any(fr, patterns) or _find_any(page, patterns):
+                return True
+        # o señales sólo en la página
+        if _find_any(page, patterns):
             return True
-        human_pause(0.4,0.7)
+        time.sleep(0.45)
     return False
 
 def click_continue_anywhere(page) -> bool:
-    # página
     if click_if_exists(page, BTN_CONTINUE):
         return True
-    # iframes
     try:
         for fr in page.frames:
             loc = fr.locator(BTN_CONTINUE).first
@@ -317,17 +445,14 @@ def click_continue_anywhere(page) -> bool:
     return False
 
 def open_panel(page) -> bool:
-    # abrir el acordeón/panel
     for _ in range(3):
         if click_if_exists(page, PANEL_HEADER): return True
-        # flexible por texto en página
         try:
             loc = page.get_by_text(re.compile(r"presentaci[oó]n\s+documentaci[oó]n", re.I)).first
             if loc.is_visible():
                 loc.scroll_into_view_if_needed()
                 human_pause(); loc.click(timeout=2000); return True
         except Exception: pass
-        # en iframes
         try:
             for fr in page.frames:
                 loc = fr.get_by_text(re.compile(r"presentaci[oó]n\s+documentaci[oó]n", re.I)).first
@@ -338,9 +463,8 @@ def open_panel(page) -> bool:
     return False
 
 def parse_has_slots(page) -> bool:
-    # señal negativa
-    if find_in_frames(page, [NO_SLOTS_TEXT], 900): return False
-    # señales positivas
+    if _find_any(page, [NO_SLOTS_TEXT]):
+        return False
     positives = [
         "div.calendar-day.available",
         "button.time-slot, a.time-slot",
@@ -364,7 +488,6 @@ def parse_has_slots(page) -> bool:
 # Flujo por consulado
 # ==========================
 def flow_consulate(context, cons_name: str, ministry_url: str):
-    # Abrir ministerio y saltar hacia widget (nueva o misma page)
     page = goto_ministry_and_open_widget(context, ministry_url, cons_name)
 
     # Esperar widget
@@ -376,16 +499,18 @@ def flow_consulate(context, cons_name: str, ministry_url: str):
             tele_send_jpg(page, f"{cons_name}: captura en error")
         raise PWTimeout("timeout esperando widget")
 
-    # Evidencia inicial
+    # Evidencia inicial del widget (ya sin spinner)
     if PROOF:
         tele_send_html(page, f"{cons_name.lower()}_before_check", f"{cons_name}: HTML inicial (widget)")
         tele_send_jpg(page, f"{cons_name}: evidencia inicial (antes de parsear)")
 
     # Continuar
     click_continue_anywhere(page)
+    wait_for_stable_render(page, max_wait_ms=9000)
 
     # Abrir panel
     open_panel(page)
+    wait_for_stable_render(page, max_wait_ms=9000)
     if PROOF:
         tele_send_html(page, f"{cons_name.lower()}_after_panel", f"{cons_name}: HTML tras abrir panel")
         tele_send_jpg(page, f"{cons_name}: pantalla tras abrir panel")
@@ -394,11 +519,11 @@ def flow_consulate(context, cons_name: str, ministry_url: str):
     has = parse_has_slots(page)
 
     # Evidencia final
+    wait_for_stable_render(page, max_wait_ms=9000)
     if PROOF:
         tele_send_html(page, f"{cons_name.lower()}_final", f"{cons_name}: HTML final — {'SÍ' if has else 'NO'}")
         tele_send_jpg(page, f"{cons_name}: captura final — {'SÍ' if has else 'NO'}")
 
-    # Cerrar pestaña de este consulado si fue popup
     try: page.close()
     except Exception: pass
 
@@ -454,7 +579,10 @@ def run_round(context):
 def main():
     tele_send_text("[start] Launching bot…")
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-dev-shm-usage","--no-sandbox"])
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-dev-shm-usage","--no-sandbox","--hide-scrollbars"]
+        )
         context = browser.new_context(**play_args_with_proxy())
 
         print_public_ip(context)
