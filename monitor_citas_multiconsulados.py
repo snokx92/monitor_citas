@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# -- coding: utf-8 --
+# -*- coding: utf-8 -*-
 
 import os, io, re, time, random
 from datetime import datetime
@@ -150,7 +150,7 @@ def tele_send_html(page, name, caption):
         pass
 
 def log_info(msg): tele_send_text(f"[INFO] {msg}")
-def log_warn(msg): tele_send_text(f"⚠ {msg}")
+def log_warn(msg): tele_send_text(f"⚠️ {msg}")
 def log_err(msg):  tele_send_text(f"❌ {msg}")
 
 # ==========================
@@ -319,7 +319,7 @@ def goto_ministry_and_open_widget(context, min_url: str, cons_name: str):
 
     # (opcional) bloquear imágenes para ahorrar datos
     if os.getenv("BLOCK_IMAGES", "ON").upper() == "ON":
-        page.route("/*", lambda r: r.abort() if r.request.resource_type in {"image","font","media"} else r.continue_())
+        page.route("**/*", lambda r: r.abort() if r.request.resource_type in {"image","font","media"} else r.continue_())
 
     # Ministerio
     page.goto(min_url, wait_until="domcontentloaded", timeout=LANDING_TIMEOUT_MS)
@@ -568,7 +568,7 @@ def run_round(context):
             log_warn(f"{name}: timeout esperando widget.")
             results.append((name, False))
         except Exception as e:
-            log_warn(f"{name}: error durante la revisión. {e._class.name_}")
+            log_warn(f"{name}: error durante la revisión. {e.__class__.__name__}")
             results.append((name, False))
         human_pause(1.6,2.4)
 
@@ -591,10 +591,10 @@ def main():
             try:
                 run_round(context)
             except Exception as e:
-                log_err(f"Fallo de ronda: {e._class.name_}")
+                log_err(f"Fallo de ronda: {e.__class__.__name__}")
             wait_s = random.randint(300, 420)   # 5–7 min
             log_info(f"Esperando {wait_s}s antes de la siguiente ronda…")
             time.sleep(wait_s)
 
-if _name_ == "_main_":
-    main()
+if __name__ == "__main__":
+    main()
