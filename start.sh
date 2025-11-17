@@ -2,7 +2,7 @@
 set -euo pipefail
 
 echo "[start] Upgrading pip…"
-python -m pip install --upgrade pip
+python -m playwright install --with-deps
 
 echo "[start] Installing Playwright + Chromium…"
 python -m playwright install --with-deps chromium
