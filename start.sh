@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
 echo "[start] Upgrading pip…"
-python -m playwright install --with-deps
+python -m pip install --upgrade pip
 
-echo "[start] Installing Playwright + Chromium…"
-python -m playwright install --with-deps chromium
+echo "[start] Installing Playwright + system deps…"
+python -m playwright install --with-deps
 
 echo "[start] Launching bot…"
 python monitor_citas_multiconsulados.py
