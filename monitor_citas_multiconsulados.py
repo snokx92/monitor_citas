@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, io, re, time, random
+import os, re, time, random, hashlib
 from datetime import datetime
 import requests
-
-# ===== JPG helper (opcional) =====
-try:
-    from PIL import Image, ImageStat           # pip install pillow
-    PIL_OK = True
-except Exception:
-    PIL_OK = False
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
@@ -19,7 +12,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # ==========================
 TELE_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELE_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
-PROOF           = os.getenv("PROOF", "ON").upper() == "ON"
+PROOF           = os.getenv("PROOF", "ON").upper() == "ON"   # ya casi no se usa
 SHOW_PUBLIC_IP  = os.getenv("SHOW_PUBLIC_IP", "ON").upper() == "ON"
 
 PROXY_HOST = os.getenv("PROXY_HOST", "").strip()
@@ -55,6 +48,12 @@ SPINNER_PATTERNS = [
 WIDGET_IFRAME_PATTERNS = [r"bookitit", r"citaconsular"]
 
 # ==========================
+# Estado de hashes HTML
+# ==========================
+# Guardamos el último hash del HTML cuando HAY citas, por consulado
+LAST_HTML_HASH_SLOTS = {}
+
+# ==========================
 # Telegram helpers
 # ==========================
 def tele_send_text(text: str):
@@ -70,6 +69,7 @@ def tele_send_text(text: str):
         pass
 
 def tele_send_doc(bytes_, filename, caption=""):
+    # Ya no lo usamos, pero lo dejo por si en el futuro quieres adjuntar algo
     if not TELE_TOKEN or not TELE_CHAT_ID:
         return
     try:
@@ -79,72 +79,6 @@ def tele_send_doc(bytes_, filename, caption=""):
             f"https://api.telegram.org/bot{TELE_TOKEN}/sendDocument",
             data=data, files=files, timeout=30
         )
-    except Exception:
-        pass
-
-# ======= Captura inteligente (anti-blanco) =======
-def _is_visual_blank(png_bytes: bytes) -> bool:
-    if not PIL_OK:
-        return False  # sin PIL no podemos validar; dejamos pasar
-    try:
-        img = Image.open(io.BytesIO(png_bytes)).convert("L")  # escala de grises
-        stat = ImageStat.Stat(img)
-        # heurísticas: varianza muy baja -> imagen plana; media muy alta -> casi blanca
-        variance = (stat.var[0] if isinstance(stat.var, list) else stat.var)
-        mean = (stat.mean[0] if isinstance(stat.mean, list) else stat.mean)
-        if variance < 25 and mean > 235:   # muy uniforme y claro
-            return True
-        # % de píxeles muy claros
-        w, h = img.size
-        if w*h == 0:
-            return True
-        bright = sum(1 for p in img.getdata() if p >= 245)
-        if bright / float(w*h) > 0.985:    # >98.5% clarísimo
-            return True
-    except Exception:
-        return False
-    return False
-
-def smart_screenshot(page, full=True, max_wait_ms=12000):
-    """Espera estabilidad y reintenta la captura si resulta 'blanca'."""
-    end = time.time() + max_wait_ms/1000.0
-    last_err = None
-    while time.time() < end:
-        try:
-            wait_for_stable_render(page, max_wait_ms=4000)
-            png = page.screenshot(full_page=full)
-            if not _is_visual_blank(png):
-                return png
-            time.sleep(0.35)
-        except Exception as e:
-            last_err = e
-            time.sleep(0.35)
-    # último intento
-    try:
-        return page.screenshot(full_page=full)
-    except Exception:
-        if last_err:
-            raise last_err
-        raise
-
-def tele_send_jpg(page, caption: str, quality: int = 82, full=True):
-    png = smart_screenshot(page, full=full, max_wait_ms=min(15000, WIDGET_TIMEOUT_MS))
-    if not PIL_OK:
-        tele_send_doc(png, "capture.png", caption)
-        return
-    try:
-        img = Image.open(io.BytesIO(png)).convert("RGB")
-        out = io.BytesIO()
-        img.save(out, format="JPEG", quality=quality, optimize=True)
-        tele_send_doc(out.getvalue(), "capture.jpg", caption)
-    except Exception:
-        tele_send_doc(png, "capture.png", caption)
-
-def tele_send_html(page, name, caption):
-    try:
-        wait_for_stable_render(page, max_wait_ms=min(15000, WIDGET_TIMEOUT_MS))
-        html = page.content().encode("utf-8", "ignore")
-        tele_send_doc(html, f"{name}.html", caption)
     except Exception:
         pass
 
@@ -294,6 +228,21 @@ def click_if_exists(page, selector) -> bool:
     return False
 
 # ==========================
+# Hash de HTML
+# ==========================
+def get_html_hash_from_page(page):
+    """
+    Devuelve (hash_hex, html_bytes) del contenido actual de la página.
+    Si falla, devuelve (None, None).
+    """
+    try:
+        html = page.content().encode("utf-8", "ignore")
+        h = hashlib.sha256(html).hexdigest()
+        return h, html
+    except Exception:
+        return None, None
+
+# ==========================
 # Salto Ministerio → citaconsular/bookitit (robusto)
 # ==========================
 def get_citaconsular_href(page) -> str:
@@ -326,9 +275,7 @@ def goto_ministry_and_open_widget(context, min_url: str, cons_name: str):
     close_overlays(page)
     wait_for_stable_render(page, max_wait_ms=8000)
 
-    if PROOF:
-        tele_send_html(page, f"{cons_name.lower()}_ministerio", f"{cons_name}: HTML inicial (ministerio)")
-        tele_send_jpg(page, f"{cons_name}: evidencia ministerio")
+    # Ya no mandamos HTML ni capturas aquí
 
     # Buscamos el enlace por texto visible
     link_sel_variants = [
@@ -493,15 +440,12 @@ def flow_consulate(context, cons_name: str, ministry_url: str):
     entry_fallback = ministry_url
     ready = wait_widget_ready(page, entry_fallback)
     if not ready:
-        if PROOF:
-            tele_send_html(page, f"{cons_name.lower()}_error_state", f"{cons_name}: HTML en error")
-            tele_send_jpg(page, f"{cons_name}: captura en error")
+        log_warn(f"{cons_name}: timeout esperando widget (estado de error).")
+        try:
+            page.close()
+        except Exception:
+            pass
         raise PWTimeout("timeout esperando widget")
-
-    # Evidencia inicial del widget (ya sin spinner)
-    if PROOF:
-        tele_send_html(page, f"{cons_name.lower()}_before_check", f"{cons_name}: HTML inicial (widget)")
-        tele_send_jpg(page, f"{cons_name}: evidencia inicial (antes de parsear)")
 
     # Continuar
     click_continue_anywhere(page)
@@ -510,21 +454,49 @@ def flow_consulate(context, cons_name: str, ministry_url: str):
     # Abrir panel
     open_panel(page)
     wait_for_stable_render(page, max_wait_ms=9000)
-    if PROOF:
-        tele_send_html(page, f"{cons_name.lower()}_after_panel", f"{cons_name}: HTML tras abrir panel")
-        tele_send_jpg(page, f"{cons_name}: pantalla tras abrir panel")
 
-    # Parseo
+    # Parseo: ¿hay citas?
     has = parse_has_slots(page)
 
-    # Evidencia final
+    # Aseguramos que el DOM esté estable antes de sacar el HTML
     wait_for_stable_render(page, max_wait_ms=9000)
-    if PROOF:
-        tele_send_html(page, f"{cons_name.lower()}_final", f"{cons_name}: HTML final — {'SÍ' if has else 'NO'}")
-        tele_send_jpg(page, f"{cons_name}: captura final — {'SÍ' if has else 'NO'}")
 
-    try: page.close()
-    except Exception: pass
+    # === NUEVA LÓGICA: detectar cambio de HTML cuando HAY citas ===
+    try:
+        current_hash, html_bytes = get_html_hash_from_page(page)
+    except Exception:
+        current_hash, html_bytes = None, None
+
+    if current_hash:
+        prev_hash = LAST_HTML_HASH_SLOTS.get(cons_name)
+
+        if has:
+            # Solo nos interesa cuando HAY citas
+            if prev_hash is None:
+                # Primera vez que vemos citas para este consulado
+                LAST_HTML_HASH_SLOTS[cons_name] = current_hash
+                tele_send_text(
+                    f"⚠️ {cons_name}: se detectan posibles citas (primer HTML con huecos)."
+                )
+            elif current_hash != prev_hash:
+                # El HTML cambió respecto al último estado con huecos
+                LAST_HTML_HASH_SLOTS[cons_name] = current_hash
+                tele_send_text(
+                    f"⚠️ {cons_name}: cambio en el HTML del widget mientras HAY citas.\n"
+                    f"Es posible que hayan aparecido nuevos huecos o cambios en la agenda."
+                )
+            else:
+                # has == True pero el HTML es igual al último estado con huecos → no avisamos
+                pass
+        else:
+            # has == False → si quieres resetear hash cuando se acaben las citas, descomenta:
+            # LAST_HTML_HASH_SLOTS[cons_name] = None
+            pass
+
+    try:
+        page.close()
+    except Exception:
+        pass
 
     return has
 
@@ -532,8 +504,7 @@ def flow_consulate(context, cons_name: str, ministry_url: str):
 # Main loop
 # ==========================
 CONSULADOS = [
-    {"name": "Monterrey",        "ministry": MIN_MTY},
-    {"name": "Ciudad de México", "ministry": MIN_CDMX},
+    {"name": "Monterrey", "ministry": MIN_MTY},
 ]
 
 def play_args_with_proxy():
@@ -571,8 +542,13 @@ def run_round(context):
             results.append((name, False))
         human_pause(1.6,2.4)
 
+    # Si quieres dejar el resumen periódico, mantenlo;
+    # si no quieres más spam, puedes comentar este for.
     for name, has in results:
-        tele_send_text(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] {name} → {'HAY huecos' if has else 'sin huecos por ahora.'}")
+        tele_send_text(
+            f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] {name} → "
+            f"{'HAY huecos' if has else 'sin huecos por ahora.'}"
+        )
     return results
 
 def main():
