@@ -36,7 +36,6 @@ HUMAN_CLICK_MIN, HUMAN_CLICK_MAX = 0.8, 1.8
 
 # URLs Ministerio
 MIN_MTY  = "https://www.exteriores.gob.es/Consulados/monterrey/es/ServiciosConsulares/Paginas/CitaNacionalidadLMD.aspx"
-MIN_CDMX = "https://www.exteriores.gob.es/Consulados/mexico/es/ServiciosConsulares/Paginas/CitaNacionalidadLMD.aspx"
 
 # Selectores/Patrones del widget
 BTN_CONTINUE   = r'text=/Continue\s*\/\s*Continuar/i'
