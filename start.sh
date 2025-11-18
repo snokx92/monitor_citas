@@ -5,4 +5,4 @@ set -e
 python -m playwright install chromium
 
 # Ejecutar el bot
-python monitor_citas_huecos.py
+python monitor_citas_multiconsulados.py
