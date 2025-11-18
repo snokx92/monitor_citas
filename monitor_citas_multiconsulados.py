@@ -1,201 +1,600 @@
-# monitor_citas_huecos.py
-import os, sys, time, random, re
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
-from playwright.sync_api import sync_playwright, TimeoutError as PTimeout
+#!/usr/bin/env python3
+# -- coding: utf-8 --
+
+import os, io, re, time, random
+from datetime import datetime
 import requests
 
-# =========================
-# CONFIGURACIÓN
-# =========================
-@dataclass
-class Config:
-    URL: str = "https://www.citaconsular.es/es/hosteds/widgetdefault/25b18886db70f7ec9fd6dfd1a85d1395f/"
+# ===== JPG helper (opcional) =====
+try:
+    from PIL import Image, ImageStat           # pip install pillow
+    PIL_OK = True
+except Exception:
+    PIL_OK = False
 
-    # Selectores/indicadores (ajustados a capturas típicas de Bookitit/citaconsular)
-    SELECTOR_CONTINUE: str = 'button.btn.btn-success, button:has-text("Continue"), button:has-text("Continuar")'
-    TEXT_NO_CITAS: str = "No hay horas disponibles"
-    # Candidatos a botones que contienen hora y la leyenda "Hueco libre"
-    BUTTON_CANDIDATES: str = "button, .btn, [role=button]"
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-    # Hints para extraer fecha visible (ej: "Miércoles 3 de Septiembre de 2025")
-    DIA_REGEX = r"(Lunes|Martes|Miércoles|Jueves|Viernes|Sábado|Domingo).*?\\b\\d{4}\\b"
+# ==========================
+# Variables de entorno
+# ==========================
+TELE_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELE_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
+PROOF           = os.getenv("PROOF", "ON").upper() == "ON"
+SHOW_PUBLIC_IP  = os.getenv("SHOW_PUBLIC_IP", "ON").upper() == "ON"
 
-    # Revisión periódica
-    CHECK_INTERVAL_SEC: int = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
+PROXY_HOST = os.getenv("PROXY_HOST", "").strip()
+PROXY_PORT = os.getenv("PROXY_PORT", "").strip()
+PROXY_USER = os.getenv("PROXY_USER", "").strip()
+PROXY_PASS = os.getenv("PROXY_PASS", "").strip()
 
-    # Notificaciones (opcional)
-    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+WIDGET_TIMEOUT_MS  = int(os.getenv("WIDGET_TIMEOUT_MS", "70000"))
+LANDING_TIMEOUT_MS = int(os.getenv("LANDING_TIMEOUT_MS", "30000"))
+GOTO_RETRIES       = int(os.getenv("GOTO_RETRIES", "2"))
 
-    # Anti-bloqueos
-    HUMAN_MIN: float = float(os.getenv("HUMAN_MIN", "0.7"))
-    HUMAN_MAX: float = float(os.getenv("HUMAN_MAX", "1.5"))
+# Esperas humanas (seg)
+HUMAN_CLICK_MIN, HUMAN_CLICK_MAX = 0.8, 1.8
 
-cfg = Config()
+# URLs Ministerio
+MIN_MTY  = "https://www.exteriores.gob.es/Consulados/monterrey/es/ServiciosConsulares/Paginas/CitaNacionalidadLMD.aspx"
+MIN_CDMX = "https://www.exteriores.gob.es/Consulados/mexico/es/ServiciosConsulares/Paginas/CitaNacionalidadLMD.aspx"
 
-def notify(msg: str):
-    print(msg, flush=True)
-    if cfg.TELEGRAM_BOT_TOKEN and cfg.TELEGRAM_CHAT_ID:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{cfg.TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": msg},
-                timeout=15
-            )
-        except Exception as e:
-            print(f"[WARN] Telegram fallo: {e}", file=sys.stderr)
+# Selectores/Patrones del widget
+BTN_CONTINUE   = r'text=/Continue\s*\/\s*Continuar/i'
+NO_SLOTS_TEXT  = r'text=/No hay horas disponibles/i'
+PANEL_HEADER   = r'text=/PRESENTACION DOCUMENTACION/i'  # ambos consulados
 
-def human_pause():
-    time.sleep(random.uniform(cfg.HUMAN_MIN, cfg.HUMAN_MAX))
+# Spinners/overlays comunes
+SPINNER_PATTERNS = [
+    r"text=/Checking Your Browser/i",
+    r"text=/Please wait.*redirected/i",
+    r"text=/Cargando|Loading|Espere|Espere un momento/i",
+    "css=.loading, .spinner, .lds-ring, .lds-roller, .loader, .sk-fading-circle, .pace, .pace-activity",
+    "css=[aria-busy=true], [data-loading=true]",
+    "css=img[alt*=loading i], svg[aria-label*=loading i]"
+]
+# Heurística: iframes/URLs habituales del widget
+WIDGET_IFRAME_PATTERNS = [r"bookitit", r"citaconsular"]
 
-TIME_RE = re.compile(r"\\b([01]?\\d|2[0-3]):[0-5]\\d\\b")  # 0:00–23:59
-
-def find_date_text(page) -> Optional[str]:
-    # Buscamos un texto tipo "Miércoles 3 de Septiembre de 2025"
+# ==========================
+# Telegram helpers
+# ==========================
+def tele_send_text(text: str):
+    if not TELE_TOKEN or not TELE_CHAT_ID:
+        return
     try:
-        content = (page.content() or "").strip()
+        requests.post(
+            f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage",
+            data={"chat_id": TELE_CHAT_ID, "text": text, "parse_mode":"HTML"},
+            timeout=15
+        )
     except Exception:
-        return None
-    # Buscar rápidamente por regex
-    m = re.search(cfg.DIA_REGEX, content, re.IGNORECASE | re.DOTALL)
-    if m:
-        return m.group(0)
+        pass
+
+def tele_send_doc(bytes_, filename, caption=""):
+    if not TELE_TOKEN or not TELE_CHAT_ID:
+        return
+    try:
+        files = {"document": (filename, bytes_)}
+        data  = {"chat_id": TELE_CHAT_ID, "caption": caption}
+        requests.post(
+            f"https://api.telegram.org/bot{TELE_TOKEN}/sendDocument",
+            data=data, files=files, timeout=30
+        )
+    except Exception:
+        pass
+
+# ======= Captura inteligente (anti-blanco) =======
+def _is_visual_blank(png_bytes: bytes) -> bool:
+    if not PIL_OK:
+        return False  # sin PIL no podemos validar; dejamos pasar
+    try:
+        img = Image.open(io.BytesIO(png_bytes)).convert("L")  # escala de grises
+        stat = ImageStat.Stat(img)
+        # heurísticas: varianza muy baja -> imagen plana; media muy alta -> casi blanca
+        variance = (stat.var[0] if isinstance(stat.var, list) else stat.var)
+        mean = (stat.mean[0] if isinstance(stat.mean, list) else stat.mean)
+        if variance < 25 and mean > 235:   # muy uniforme y claro
+            return True
+        # % de píxeles muy claros
+        w, h = img.size
+        if w*h == 0:
+            return True
+        bright = sum(1 for p in img.getdata() if p >= 245)
+        if bright / float(w*h) > 0.985:    # >98.5% clarísimo
+            return True
+    except Exception:
+        return False
+    return False
+
+def smart_screenshot(page, full=True, max_wait_ms=12000):
+    """Espera estabilidad y reintenta la captura si resulta 'blanca'."""
+    end = time.time() + max_wait_ms/1000.0
+    last_err = None
+    while time.time() < end:
+        try:
+            wait_for_stable_render(page, max_wait_ms=4000)
+            png = page.screenshot(full_page=full)
+            if not _is_visual_blank(png):
+                return png
+            time.sleep(0.35)
+        except Exception as e:
+            last_err = e
+            time.sleep(0.35)
+    # último intento
+    try:
+        return page.screenshot(full_page=full)
+    except Exception:
+        if last_err:
+            raise last_err
+        raise
+
+def tele_send_jpg(page, caption: str, quality: int = 82, full=True):
+    png = smart_screenshot(page, full=full, max_wait_ms=min(15000, WIDGET_TIMEOUT_MS))
+    if not PIL_OK:
+        tele_send_doc(png, "capture.png", caption)
+        return
+    try:
+        img = Image.open(io.BytesIO(png)).convert("RGB")
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=quality, optimize=True)
+        tele_send_doc(out.getvalue(), "capture.jpg", caption)
+    except Exception:
+        tele_send_doc(png, "capture.png", caption)
+
+def tele_send_html(page, name, caption):
+    try:
+        wait_for_stable_render(page, max_wait_ms=min(15000, WIDGET_TIMEOUT_MS))
+        html = page.content().encode("utf-8", "ignore")
+        tele_send_doc(html, f"{name}.html", caption)
+    except Exception:
+        pass
+
+def log_info(msg): tele_send_text(f"[INFO] {msg}")
+def log_warn(msg): tele_send_text(f"⚠ {msg}")
+def log_err(msg):  tele_send_text(f"❌ {msg}")
+
+# ==========================
+# Utilidades Playwright
+# ==========================
+def human_pause(a=HUMAN_CLICK_MIN, b=HUMAN_CLICK_MAX):
+    time.sleep(random.uniform(a,b))
+
+def safe_wait(page, state="domcontentloaded", t=LANDING_TIMEOUT_MS):
+    try:
+        page.wait_for_load_state(state=state, timeout=t)
+    except Exception:
+        pass
+
+def close_overlays(page):
+    selectors = [
+        "button[aria-label*=accept i], button:has-text('Aceptar')",
+        "button:has-text('Entendido')",
+        "div.cookie *:has-text('Aceptar')",
+        "div[role=dialog] button:has-text('OK')",
+        "div[aria-label*=close i], button[aria-label*=close i]"
+    ]
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if el.is_visible():
+                el.click()
+                human_pause()
+        except Exception:
+            pass
+
+def scroll_full(page):
+    try:
+        page.evaluate("""() => new Promise(r=>{
+          let y=0; const h=document.body.scrollHeight+800;
+          (function step(){ window.scrollBy(0,600); y+=600; 
+            if(y<h) requestAnimationFrame(step); else r(); })();
+        })""")
+    except Exception:
+        pass
+
+def _any_visible(loc):
+    try:
+        return loc.first.is_visible()
+    except Exception:
+        return False
+
+def _find_any(page, patterns):
+    # página
+    for pat in patterns:
+        try:
+            if _any_visible(page.locator(pat)):
+                return True
+        except Exception:
+            pass
+    # iframes
+    try:
+        for fr in page.frames:
+            for pat in patterns:
+                try:
+                    if _any_visible(fr.locator(pat)):
+                        return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False
+
+def _find_widget_iframe(page):
+    try:
+        for fr in page.frames:
+            url = (fr.url or "").lower()
+            for pat in WIDGET_IFRAME_PATTERNS:
+                if re.search(pat, url, re.I):
+                    return fr
+    except Exception:
+        pass
     return None
 
-def extract_real_slots(page) -> List[Tuple[str, str]]:
-    """
-    Devuelve lista de (hora, texto_boton) únicamente si el botón contiene una hora
-    y, en el mismo bloque, aparece 'Hueco libre' (para evitar falsos positivos).
-    """
-    slots = []
+def _textlen(page_or_frame):
     try:
-        candidates = page.locator(cfg.BUTTON_CANDIDATES)
-        count = candidates.count()
+        txt = page_or_frame.evaluate("() => document.body && document.body.innerText || ''")
+        return len(txt or "")
     except Exception:
-        count = 0
+        return 0
 
-    for i in range(min(count, 300)):  # límite de seguridad
-        try:
-            el = candidates.nth(i)
-            if not el.is_visible():
-                continue
-            text = el.inner_text().strip()
-            if not text:
-                continue
-            if "hueco libre" not in text.lower():
-                continue
-            m = TIME_RE.search(text)
-            if m:
-                slots.append((m.group(0), text))
-        except Exception:
-            continue
-    return slots
-
-def revisar_una_vez(headless: bool = True) -> Tuple[bool, List[Tuple[str, str]], Optional[str]]:
+def wait_for_stable_render(page, max_wait_ms=15000, stable_cycles=3, poll_ms=300):
     """
-    Retorna: (hay_huecos, slots, fecha_visible)
-    slots = lista [(hora, texto_boton)...]
+    Espera a que:
+      1) No haya spinners/overlays comunes visibles en página e iframes
+      2) El DOM esté "estable": el length del innerText no varíe mucho durante varios ciclos
+      3) Si hay iframe del widget, que sea visible y sin spinner
+      4) Haya algo de texto (> 80 chars) para evitar páginas "vacías"
     """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124 Safari/537.36")
-        )
+    end = time.time() + max_wait_ms/1000.0
+    last_len = _textlen(page)
+    stable = 0
 
-        # Primer aviso: alert("Welcome / Bienvenido") — aceptar automáticamente
-        def on_dialog(dialog):
-            try:
-                dialog.accept()
-            except Exception:
-                pass
-        context.on("dialog", on_dialog)
+    while time.time() < end:
+        # 1) Nada de spinners
+        if _find_any(page, SPINNER_PATTERNS):
+            stable = 0
+            time.sleep(poll_ms/1000.0); continue
 
-        page = context.new_page()
-        page.set_default_timeout(20000)
+        # 3) Iframe del widget listo
+        fr = _find_widget_iframe(page)
+        if fr and (_find_any(fr, SPINNER_PATTERNS)):
+            stable = 0
+            time.sleep(poll_ms/1000.0); continue
 
-        page.goto(cfg.URL, wait_until="domcontentloaded")
-        human_pause()
+        # 4) Algo de texto
+        ln = _textlen(page)
+        if ln < 80:
+            stable = 0
+            time.sleep(poll_ms/1000.0); continue
 
-        # Botón Continue / Continuar
-        try:
-            page.wait_for_selector(cfg.SELECTOR_CONTINUE, timeout=8000)
-            page.click(cfg.SELECTOR_CONTINUE, force=True)
+        # 2) DOM relativamente estable
+        if abs(ln - last_len) <= 20:
+            stable += 1
+        else:
+            stable = 0
+        last_len = ln
+
+        if stable >= stable_cycles:
+            return True
+
+        time.sleep(poll_ms/1000.0)
+
+    return False
+
+def click_if_exists(page, selector) -> bool:
+    try:
+        loc = page.locator(selector).first
+        if loc.is_visible():
+            loc.scroll_into_view_if_needed(timeout=1500)
             human_pause()
-        except PTimeout:
-            # A veces ya estás dentro; seguimos.
-            pass
+            loc.click(timeout=2000)
+            human_pause()
+            return True
+    except Exception:
+        pass
+    return False
 
-        # Si aparece explícitamente el mensaje de no disponibilidad, salimos
-        try:
-            page.get_by_text(cfg.TEXT_NO_CITAS, exact=False).wait_for(timeout=3000)
-            fecha = find_date_text(page)
-            browser.close()
-            return (False, [], fecha)
-        except PTimeout:
-            pass
-
-        # Buscar huecos reales
-        slots = extract_real_slots(page)
-        fecha = find_date_text(page)
-
-        # Por si el contenido está en iframe (pasa en algunos Bookitit)
-        if not slots:
-            for fr in page.frames:
-                if fr == page.main_frame:
-                    continue
-                try:
-                    slots = extract_real_slots(fr)
-                    if not fecha:
-                        fecha = find_date_text(fr)
-                    if slots:
-                        break
-                except Exception:
-                    continue
-
-        if slots:
+# ==========================
+# Salto Ministerio → citaconsular/bookitit (robusto)
+# ==========================
+def get_citaconsular_href(page) -> str:
+    """Busca un <a> cuyo href contenga citaconsular/bookitit."""
+    try:
+        anchors = page.locator("a")
+        n = min(400, anchors.count())
+        for i in range(n):
             try:
-                page.screenshot(path="citas_disponibles.png", full_page=True)
+                href = anchors.nth(i).get_attribute("href") or ""
+                if re.search(r"(citaconsular|bookitit)", href, re.I):
+                    return href
             except Exception:
                 pass
-            browser.close()
-            return (True, slots, fecha)
+    except Exception:
+        pass
+    return ""
 
-        # No hay texto de “no hay horas…”, pero tampoco huecos reales:
+def goto_ministry_and_open_widget(context, min_url: str, cons_name: str):
+    page = context.new_page()
+    page.set_default_timeout(LANDING_TIMEOUT_MS)
+
+    # (opcional) bloquear imágenes para ahorrar datos
+    if os.getenv("BLOCK_IMAGES", "ON").upper() == "ON":
+        page.route("/*", lambda r: r.abort() if r.request.resource_type in {"image","font","media"} else r.continue_())
+
+    # Ministerio
+    page.goto(min_url, wait_until="domcontentloaded", timeout=LANDING_TIMEOUT_MS)
+    safe_wait(page, "networkidle", LANDING_TIMEOUT_MS)
+    close_overlays(page)
+    wait_for_stable_render(page, max_wait_ms=8000)
+
+    if PROOF:
+        tele_send_html(page, f"{cons_name.lower()}_ministerio", f"{cons_name}: HTML inicial (ministerio)")
+        tele_send_jpg(page, f"{cons_name}: evidencia ministerio")
+
+    # Buscamos el enlace por texto visible
+    link_sel_variants = [
+        "a:has-text('ELEGIR FECHA Y HORA')",
+        "button:has-text('ELEGIR FECHA Y HORA')",
+        "a:has-text('Elegir fecha y hora')",
+        "a:has-text('ELIGIR FECHA Y HORA')"
+    ]
+    link = None
+    for sel in link_sel_variants:
         try:
-            page.screenshot(path="sin_huecos.png", full_page=True)
+            loc = page.locator(sel).first
+            if loc.is_visible():
+                link = loc
+                break
         except Exception:
             pass
-        browser.close()
-        return (False, [], fecha)
+
+    # Si no lo hallamos por texto, intentamos por href
+    if not link:
+        href = get_citaconsular_href(page)
+        if href:
+            page.goto(href, wait_until="domcontentloaded", timeout=LANDING_TIMEOUT_MS)
+            safe_wait(page, "networkidle", LANDING_TIMEOUT_MS)
+            wait_for_stable_render(page, max_wait_ms=12000)
+            return page
+
+    # Tenemos un locator clickable → intentar popup
+    if link:
+        try:
+            with page.expect_popup(timeout=5000) as p:
+                link.scroll_into_view_if_needed()
+                human_pause()
+                link.click()
+            new_page = p.value
+            safe_wait(new_page, "domcontentloaded", LANDING_TIMEOUT_MS)
+            safe_wait(new_page, "networkidle", LANDING_TIMEOUT_MS)
+            wait_for_stable_render(new_page, max_wait_ms=12000)
+            return new_page
+        except Exception:
+            # Sin popup: ir por href
+            try:
+                href = link.get_attribute("href") or ""
+                if href:
+                    page.goto(href, wait_until="domcontentloaded", timeout=LANDING_TIMEOUT_MS)
+                    safe_wait(page, "networkidle", LANDING_TIMEOUT_MS)
+                    wait_for_stable_render(page, max_wait_ms=12000)
+                    return page
+            except Exception:
+                pass
+            # Último recurso
+            try:
+                page.evaluate("(el)=>el.click()", link.element_handle())
+                time.sleep(1.0)
+                href2 = get_citaconsular_href(page)
+                if href2:
+                    page.goto(href2, wait_until="domcontentloaded", timeout=LANDING_TIMEOUT_MS)
+                    safe_wait(page, "networkidle", LANDING_TIMEOUT_MS)
+                    wait_for_stable_render(page, max_wait_ms=12000)
+                    return page
+            except Exception:
+                pass
+
+    # si llegamos aquí, no pudimos saltar; devolver ministerio
+    return page
+
+# ==========================
+# Widget helpers
+# ==========================
+def wait_widget_ready(page, entry_fallback=None) -> bool:
+    patterns = [BTN_CONTINUE, NO_SLOTS_TEXT]
+    if _wait_widget_once(page, patterns, WIDGET_TIMEOUT_MS):
+        return True
+    if entry_fallback:
+        log_warn("Timeout al esperar widget; intento volver a entrada y re–checar…")
+        try:
+            page.goto(entry_fallback, wait_until="domcontentloaded", timeout=LANDING_TIMEOUT_MS)
+            safe_wait(page, "networkidle", LANDING_TIMEOUT_MS)
+            close_overlays(page)
+            wait_for_stable_render(page, max_wait_ms=8000)
+        except Exception:
+            pass
+        return _wait_widget_once(page, patterns, WIDGET_TIMEOUT_MS)
+    return False
+
+def _wait_widget_once(page, patterns, timeout_ms) -> bool:
+    end = time.time() + timeout_ms/1000.0
+    while time.time() < end:
+        close_overlays(page)
+        fr = _find_widget_iframe(page)
+        # si hay iframe del widget y no hay spinners, buscar señales dentro
+        if fr and not _find_any(page, SPINNER_PATTERNS) and not _find_any(fr, SPINNER_PATTERNS):
+            if _find_any(fr, patterns) or _find_any(page, patterns):
+                return True
+        # o señales sólo en la página
+        if _find_any(page, patterns):
+            return True
+        time.sleep(0.45)
+    return False
+
+def click_continue_anywhere(page) -> bool:
+    if click_if_exists(page, BTN_CONTINUE):
+        return True
+    try:
+        for fr in page.frames:
+            loc = fr.locator(BTN_CONTINUE).first
+            if loc.is_visible():
+                loc.click(timeout=2000)
+                human_pause()
+                return True
+    except Exception:
+        pass
+    return False
+
+def open_panel(page) -> bool:
+    for _ in range(3):
+        if click_if_exists(page, PANEL_HEADER): return True
+        try:
+            loc = page.get_by_text(re.compile(r"presentaci[oó]n\s+documentaci[oó]n", re.I)).first
+            if loc.is_visible():
+                loc.scroll_into_view_if_needed()
+                human_pause(); loc.click(timeout=2000); return True
+        except Exception: pass
+        try:
+            for fr in page.frames:
+                loc = fr.get_by_text(re.compile(r"presentaci[oó]n\s+documentaci[oó]n", re.I)).first
+                if loc.is_visible():
+                    loc.click(timeout=2000); return True
+        except Exception: pass
+        human_pause()
+    return False
+
+def parse_has_slots(page) -> bool:
+    if _find_any(page, [NO_SLOTS_TEXT]):
+        return False
+    positives = [
+        "div.calendar-day.available",
+        "button.time-slot, a.time-slot",
+        "div#slots-container button, div#slots-container a",
+        "a:has-text('Cambiar de día') ~ div button"
+    ]
+    for sel in positives:
+        try:
+            if page.locator(sel).first.is_visible(): return True
+        except Exception: pass
+    try:
+        for fr in page.frames:
+            for sel in positives:
+                try:
+                    if fr.locator(sel).first.is_visible(): return True
+                except Exception: pass
+    except Exception: pass
+    return False
+
+# ==========================
+# Flujo por consulado
+# ==========================
+def flow_consulate(context, cons_name: str, ministry_url: str):
+    page = goto_ministry_and_open_widget(context, ministry_url, cons_name)
+
+    # Esperar widget
+    entry_fallback = ministry_url
+    ready = wait_widget_ready(page, entry_fallback)
+    if not ready:
+        if PROOF:
+            tele_send_html(page, f"{cons_name.lower()}_error_state", f"{cons_name}: HTML en error")
+            tele_send_jpg(page, f"{cons_name}: captura en error")
+        raise PWTimeout("timeout esperando widget")
+
+    # Evidencia inicial del widget (ya sin spinner)
+    if PROOF:
+        tele_send_html(page, f"{cons_name.lower()}_before_check", f"{cons_name}: HTML inicial (widget)")
+        tele_send_jpg(page, f"{cons_name}: evidencia inicial (antes de parsear)")
+
+    # Continuar
+    click_continue_anywhere(page)
+    wait_for_stable_render(page, max_wait_ms=9000)
+
+    # Abrir panel
+    open_panel(page)
+    wait_for_stable_render(page, max_wait_ms=9000)
+    if PROOF:
+        tele_send_html(page, f"{cons_name.lower()}_after_panel", f"{cons_name}: HTML tras abrir panel")
+        tele_send_jpg(page, f"{cons_name}: pantalla tras abrir panel")
+
+    # Parseo
+    has = parse_has_slots(page)
+
+    # Evidencia final
+    wait_for_stable_render(page, max_wait_ms=9000)
+    if PROOF:
+        tele_send_html(page, f"{cons_name.lower()}_final", f"{cons_name}: HTML final — {'SÍ' if has else 'NO'}")
+        tele_send_jpg(page, f"{cons_name}: captura final — {'SÍ' if has else 'NO'}")
+
+    try: page.close()
+    except Exception: pass
+
+    return has
+
+# ==========================
+# Main loop
+# ==========================
+CONSULADOS = [
+    {"name": "Monterrey",        "ministry": MIN_MTY},
+    {"name": "Ciudad de México", "ministry": MIN_CDMX},
+]
+
+def play_args_with_proxy():
+    if not PROXY_HOST or not PROXY_PORT: return {}
+    proxy = {"server": f"http://{PROXY_HOST}:{PROXY_PORT}"}
+    if PROXY_USER and PROXY_PASS:
+        proxy["username"] = PROXY_USER
+        proxy["password"] = PROXY_PASS
+    return {"proxy": proxy}
+
+def print_public_ip(context):
+    if not SHOW_PUBLIC_IP: return
+    try:
+        p = context.new_page()
+        p.goto("https://api.ipify.org?format=json", timeout=15000)
+        txt = p.inner_text("pre, body")
+        m = re.search(r'"ip"\s*:\s*"([^"]+)"', txt); ip = m.group(1) if m else txt.strip()
+        log_info(f"IP pública: {ip}")
+        p.close()
+    except Exception:
+        pass
+
+def run_round(context):
+    results = []
+    for cons in CONSULADOS:
+        name, url = cons["name"], cons["ministry"]
+        try:
+            has = flow_consulate(context, name, url)
+            results.append((name, has))
+        except PWTimeout:
+            log_warn(f"{name}: timeout esperando widget.")
+            results.append((name, False))
+        except Exception as e:
+            log_warn(f"{name}: error durante la revisión. {e._class.name_}")
+            results.append((name, False))
+        human_pause(1.6,2.4)
+
+    for name, has in results:
+        tele_send_text(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] {name} → {'HAY huecos' if has else 'sin huecos por ahora.'}")
+    return results
 
 def main():
-    # Bucle de monitoreo
-    while True:
-        try:
-            ok, slots, fecha = revisar_una_vez(headless=True)
-            if ok and slots:
-                primeras = ", ".join(sorted({h for h, _ in slots})[:5])
-                f = f" ({fecha})" if fecha else ""
-                notify(f"✅ ¡HAY HUECOS!{f} → Horas: {primeras}\nEntra ya: {cfg.URL}")
-                # Después de encontrar huecos, espera un poco antes de volver a revisar
-                time.sleep(300)
-            else:
-                marca = time.strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{marca}] Sin huecos reales por ahora.", flush=True)
-                time.sleep(cfg.CHECK_INTERVAL_SEC)
-        except Exception as e:
-            print(f"[ERROR] {e}", flush=True)
-            time.sleep(120)
+    tele_send_text("[start] Launching bot…")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-dev-shm-usage","--no-sandbox","--hide-scrollbars"]
+        )
+        context = browser.new_context(**play_args_with_proxy())
 
-if __name__ == "__main__":
-    # Ejecuta:  python monitor_citas_huecos.py
-    # Debug con navegador visible:  python monitor_citas_huecos.py headed
-    headed = len(sys.argv) > 1 and sys.argv[1].lower().startswith("head")
-    if headed:
-        ok, slots, fecha = revisar_una_vez(headless=False)
-        print("OK:", ok, "slots:", slots, "fecha:", fecha)
-    else:
-        main()
+        print_public_ip(context)
+
+        while True:
+            try:
+                run_round(context)
+            except Exception as e:
+                log_err(f"Fallo de ronda: {e._class.name_}")
+            wait_s = random.randint(300, 420)   # 5–7 min
+            log_info(f"Esperando {wait_s}s antes de la siguiente ronda…")
+            time.sleep(wait_s)
+
+if _name_ == "_main_":
+    main()
