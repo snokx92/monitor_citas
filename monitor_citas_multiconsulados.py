@@ -567,7 +567,7 @@ def main():
                 run_round(context)
             except Exception as e:
                 log_err(f"Fallo de ronda: {e.__class__.__name__}")
-            wait_s = random.randint(300, 420)   # 5–7 min
+            wait_s = random.randint(120, 300)   # 2–5 min
             log_info(f"Esperando {wait_s}s antes de la siguiente ronda…")
             time.sleep(wait_s)
 
