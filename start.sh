@@ -1,12 +1,8 @@
-#!/usr/bin/env bash
+#!/bin/bash
+set -e
 
-set -euo pipefail
+# Instalar navegadores para Playwright (Chromium headless)
+python -m playwright install chromium
 
-echo "[start] Upgrading pip…"
-python -m pip install --upgrade pip
-
-echo "[start] Installing Playwright + system deps…"
-python -m playwright install --with-deps
-
-echo "[start] Launching bot…"
-python monitor_citas_multiconsulados.py
+# Ejecutar el bot
+python monitor_citas_huecos.py
