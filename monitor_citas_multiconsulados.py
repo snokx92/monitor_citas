@@ -36,7 +36,6 @@ HUMAN_CLICK_MIN, HUMAN_CLICK_MAX = 0.8, 1.8
 
 # URLs Ministerio
 MIN_MTY  = "https://www.exteriores.gob.es/Consulados/monterrey/es/ServiciosConsulares/Paginas/CitaNacionalidadLMD.aspx"
-MIN_CDMX = "https://www.exteriores.gob.es/Consulados/mexico/es/ServiciosConsulares/Paginas/CitaNacionalidadLMD.aspx"
 
 # Selectores/Patrones del widget
 BTN_CONTINUE   = r'text=/Continue\s*\/\s*Continuar/i'
@@ -64,7 +63,7 @@ def tele_send_text(text: str):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage",
-            data={"chat_id": TELE_CHAT_ID, "text": text, "parse_mode":"HTML"},
+            data={"chat_id": TELE_CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=15
         )
     except Exception:
@@ -157,7 +156,7 @@ def log_err(msg):  tele_send_text(f"❌ {msg}")
 # Utilidades Playwright
 # ==========================
 def human_pause(a=HUMAN_CLICK_MIN, b=HUMAN_CLICK_MAX):
-    time.sleep(random.uniform(a,b))
+    time.sleep(random.uniform(a, b))
 
 def safe_wait(page, state="domcontentloaded", t=LANDING_TIMEOUT_MS):
     try:
@@ -253,19 +252,22 @@ def wait_for_stable_render(page, max_wait_ms=15000, stable_cycles=3, poll_ms=300
         # 1) Nada de spinners
         if _find_any(page, SPINNER_PATTERNS):
             stable = 0
-            time.sleep(poll_ms/1000.0); continue
+            time.sleep(poll_ms/1000.0)
+            continue
 
         # 3) Iframe del widget listo
         fr = _find_widget_iframe(page)
         if fr and (_find_any(fr, SPINNER_PATTERNS)):
             stable = 0
-            time.sleep(poll_ms/1000.0); continue
+            time.sleep(poll_ms/1000.0)
+            continue
 
         # 4) Algo de texto
         ln = _textlen(page)
         if ln < 80:
             stable = 0
-            time.sleep(poll_ms/1000.0); continue
+            time.sleep(poll_ms/1000.0)
+            continue
 
         # 2) DOM relativamente estable
         if abs(ln - last_len) <= 20:
@@ -319,7 +321,7 @@ def goto_ministry_and_open_widget(context, min_url: str, cons_name: str):
 
     # (opcional) bloquear imágenes para ahorrar datos
     if os.getenv("BLOCK_IMAGES", "ON").upper() == "ON":
-        page.route("/*", lambda r: r.abort() if r.request.resource_type in {"image","font","media"} else r.continue_())
+        page.route("/*", lambda r: r.abort() if r.request.resource_type in {"image", "font", "media"} else r.continue_())
 
     # Ministerio
     page.goto(min_url, wait_until="domcontentloaded", timeout=LANDING_TIMEOUT_MS)
@@ -446,19 +448,25 @@ def click_continue_anywhere(page) -> bool:
 
 def open_panel(page) -> bool:
     for _ in range(3):
-        if click_if_exists(page, PANEL_HEADER): return True
+        if click_if_exists(page, PANEL_HEADER):
+            return True
         try:
             loc = page.get_by_text(re.compile(r"presentaci[oó]n\s+documentaci[oó]n", re.I)).first
             if loc.is_visible():
                 loc.scroll_into_view_if_needed()
-                human_pause(); loc.click(timeout=2000); return True
-        except Exception: pass
+                human_pause()
+                loc.click(timeout=2000)
+                return True
+        except Exception:
+            pass
         try:
             for fr in page.frames:
                 loc = fr.get_by_text(re.compile(r"presentaci[oó]n\s+documentaci[oó]n", re.I)).first
                 if loc.is_visible():
-                    loc.click(timeout=2000); return True
-        except Exception: pass
+                    loc.click(timeout=2000)
+                    return True
+        except Exception:
+            pass
         human_pause()
     return False
 
@@ -473,15 +481,20 @@ def parse_has_slots(page) -> bool:
     ]
     for sel in positives:
         try:
-            if page.locator(sel).first.is_visible(): return True
-        except Exception: pass
+            if page.locator(sel).first.is_visible():
+                return True
+        except Exception:
+            pass
     try:
         for fr in page.frames:
             for sel in positives:
                 try:
-                    if fr.locator(sel).first.is_visible(): return True
-                except Exception: pass
-    except Exception: pass
+                    if fr.locator(sel).first.is_visible():
+                        return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
     return False
 
 # ==========================
@@ -524,8 +537,10 @@ def flow_consulate(context, cons_name: str, ministry_url: str):
         tele_send_html(page, f"{cons_name.lower()}_final", f"{cons_name}: HTML final — {'SÍ' if has else 'NO'}")
         tele_send_jpg(page, f"{cons_name}: captura final — {'SÍ' if has else 'NO'}")
 
-    try: page.close()
-    except Exception: pass
+    try:
+        page.close()
+    except Exception:
+        pass
 
     return has
 
@@ -533,12 +548,12 @@ def flow_consulate(context, cons_name: str, ministry_url: str):
 # Main loop
 # ==========================
 CONSULADOS = [
-    {"name": "Monterrey",        "ministry": MIN_MTY},
-    {"name": "Ciudad de México", "ministry": MIN_CDMX},
+    {"name": "Monterrey", "ministry": MIN_MTY},
 ]
 
 def play_args_with_proxy():
-    if not PROXY_HOST or not PROXY_PORT: return {}
+    if not PROXY_HOST or not PROXY_PORT:
+        return {}
     proxy = {"server": f"http://{PROXY_HOST}:{PROXY_PORT}"}
     if PROXY_USER and PROXY_PASS:
         proxy["username"] = PROXY_USER
@@ -546,12 +561,14 @@ def play_args_with_proxy():
     return {"proxy": proxy}
 
 def print_public_ip(context):
-    if not SHOW_PUBLIC_IP: return
+    if not SHOW_PUBLIC_IP:
+        return
     try:
         p = context.new_page()
         p.goto("https://api.ipify.org?format=json", timeout=15000)
         txt = p.inner_text("pre, body")
-        m = re.search(r'"ip"\s*:\s*"([^"]+)"', txt); ip = m.group(1) if m else txt.strip()
+        m = re.search(r'"ip"\s*:\s*"([^"]+)"', txt)
+        ip = m.group(1) if m else txt.strip()
         log_info(f"IP pública: {ip}")
         p.close()
     except Exception:
@@ -568,12 +585,15 @@ def run_round(context):
             log_warn(f"{name}: timeout esperando widget.")
             results.append((name, False))
         except Exception as e:
-            log_warn(f"{name}: error durante la revisión. {e._class.name_}")
+            log_warn(f"{name}: error durante la revisión. {e.__class__.__name__}: {e}")
             results.append((name, False))
-        human_pause(1.6,2.4)
+        human_pause(1.6, 2.4)
 
     for name, has in results:
-        tele_send_text(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] {name} → {'HAY huecos' if has else 'sin huecos por ahora.'}")
+        tele_send_text(
+            f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] {name} → "
+            f"{'HAY huecos' if has else 'sin huecos por ahora.'}"
+        )
     return results
 
 def main():
@@ -581,7 +601,7 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--disable-dev-shm-usage","--no-sandbox","--hide-scrollbars"]
+            args=["--disable-dev-shm-usage", "--no-sandbox", "--hide-scrollbars"]
         )
         context = browser.new_context(**play_args_with_proxy())
 
@@ -591,10 +611,10 @@ def main():
             try:
                 run_round(context)
             except Exception as e:
-                log_err(f"Fallo de ronda: {e._class.name_}")
+                log_err(f"Fallo de ronda: {e.__class__.__name__}: {e}")
             wait_s = random.randint(300, 420)   # 5–7 min
             log_info(f"Esperando {wait_s}s antes de la siguiente ronda…")
             time.sleep(wait_s)
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()
