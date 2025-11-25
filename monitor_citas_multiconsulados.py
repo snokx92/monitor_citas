@@ -596,7 +596,12 @@ def run_round(context):
         )
     return results
 
-def main():
+# =========
+# MAIN
+# =========
+
+def main_once():
+    """Una ejecución completa del bot; si algo crítico falla, dejamos que levante excepción."""
     tele_send_text("[start] Launching bot…")
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -615,6 +620,16 @@ def main():
             wait_s = random.randint(120, 280)   # 2–5 min
             log_info(f"Esperando {wait_s}s antes de la siguiente ronda…")
             time.sleep(wait_s)
+
+def main():
+    """Bucle de alta resistencia: si Playwright o el navegador revientan, reintenta en lugar de salir."""
+    while True:
+        try:
+            main_once()
+        except Exception as e:
+            log_err(f"Fallo crítico en main(): {e.__class__.__name__}: {e}")
+            # Pequeña espera antes de relanzar todo Playwright / navegador
+            time.sleep(60)
 
 if __name__ == "__main__":
     main()
