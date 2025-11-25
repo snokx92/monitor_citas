@@ -1,11 +1,8 @@
 #!/bin/bash
 set -x
 
-echo "[start.sh] Instalando Playwright…"
-python3 -m playwright install --with-deps chromium || true
+echo "[start.sh] Instalando Playwright (si hace falta)…"
+python3 -m playwright install --with-deps chromium || echo "[start.sh] playwright install falló, pero continúo."
 
 echo "[start.sh] Lanzando bot…"
-python3 monitor_citas_multiconsulados.py
-
-echo "[start.sh] El bot terminó con código $?"
-sleep 300
+exec python3 monitor_citas_multiconsulados.py
