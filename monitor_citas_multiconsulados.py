@@ -27,7 +27,7 @@ PROXY_PORT = os.getenv("PROXY_PORT", "").strip()
 PROXY_USER = os.getenv("PROXY_USER", "").strip()
 PROXY_PASS = os.getenv("PROXY_PASS", "").strip()
 
-WIDGET_TIMEOUT_MS  = int(os.getenv("WIDGET_TIMEOUT_MS", "70000"))
+WIDGET_TIMEOUT_MS  = int(os.getenv("WIDGET_TIMEOUT_MS", "90000"))
 LANDING_TIMEOUT_MS = int(os.getenv("LANDING_TIMEOUT_MS", "30000"))
 GOTO_RETRIES       = int(os.getenv("GOTO_RETRIES", "2"))
 
